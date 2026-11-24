@@ -10,6 +10,10 @@ import { showNotification } from "./settings.js";
 
 let importSelectedMenuOutsideHandler = null;
 
+// 搜索进行中标记：按钮连点、回车+按钮同时触发时只跑一路，避免两路
+// 搜索互相覆盖、其中一路失败时把搜索视图收回播放列表。
+let searchInFlight = false;
+
 export function ensureSelectedSearchResultsSet(state) {
     if (!(state.selectedSearchResults instanceof Set)) {
         state.selectedSearchResults = new Set();
@@ -432,9 +436,26 @@ export async function performSearch(isLiveSearch = false, state, dom, callbacks 
         callbacks.closeSourceMenu();
     }
 
+    // 已有一路搜索在跑时直接忽略本次触发（连点/回车+点击同发），避免
+    // 后一路失败时把搜索视图收回、看起来像“搜索后还停在播放列表”。
+    if (searchInFlight) return;
+    searchInFlight = true;
+
     const source = normalizeSource(state.searchSource);
     state.searchSource = source;
     safeSetLocalStorage("searchSource", source);
+
+    // 先同步切到搜索视图并亮起“搜索中”状态，再做后续重置与网络请求：
+    // 点搜索按钮的当下界面就必须离开播放列表，而不是等接口返回才切。
+    const earlyListContainer = dom.searchResultsList || dom.searchResults;
+    showSearchResults(state, dom);
+    if (earlyListContainer) {
+        earlyListContainer.classList.add("is-searching");
+    }
+    if (dom.searchBtn) {
+        dom.searchBtn.disabled = true;
+        dom.searchBtn.innerHTML = '<span class="loader"></span><span>搜索中...</span>';
+    }
 
     if (!isLiveSearch) {
         state.searchPage = 1;
@@ -447,6 +468,7 @@ export async function performSearch(isLiveSearch = false, state, dom, callbacks 
         const listContainer = dom.searchResultsList || dom.searchResults;
         if (listContainer) {
             listContainer.innerHTML = "";
+            listContainer.classList.add("is-searching");
         }
         if (typeof debugLogger === "function") debugLogger(`开始新搜索: ${query}, 来源: ${source}`);
     } else {
@@ -457,13 +479,6 @@ export async function performSearch(isLiveSearch = false, state, dom, callbacks 
     const listContainer = dom.searchResultsList || dom.searchResults;
 
     try {
-        dom.searchBtn.disabled = true;
-        dom.searchBtn.innerHTML = '<span class="loader"></span><span>搜索中...</span>';
-
-        showSearchResults(state, dom);
-        if (listContainer) {
-            listContainer.classList.add("is-searching");
-        }
         const log = (msg) => {
             if (typeof debugLogger === "function") debugLogger(msg);
             else if (typeof window !== "undefined" && typeof window.__solaraDebugLog === "function") window.__solaraDebugLog(msg);
@@ -500,18 +515,22 @@ export async function performSearch(isLiveSearch = false, state, dom, callbacks 
     } catch (error) {
         console.error("搜索失败:", error);
         showNotification("搜索失败，请稍后重试", "error", dom);
-        hideSearchResults(state, dom);
+        // 搜索出错时也留在搜索视图（只显示提示与空结果引导），绝不收回
+        // 播放列表——否则看起来就是“搜了还停在播放列表”。
         const logErr = (msg) => {
             if (typeof debugLogger === "function") debugLogger(msg);
             else if (typeof window !== "undefined" && typeof window.__solaraDebugLog === "function") window.__solaraDebugLog(msg);
         };
         logErr(`[搜索异常] 出错: ${error.message || error}`);
     } finally {
+        searchInFlight = false;
         if (listContainer) {
             listContainer.classList.remove("is-searching");
         }
-        dom.searchBtn.disabled = false;
-        dom.searchBtn.innerHTML = '<svg class="apple-svg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg><span>搜索</span>';
+        if (dom.searchBtn) {
+            dom.searchBtn.disabled = false;
+            dom.searchBtn.innerHTML = '<svg class="apple-svg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg><span>搜索</span>';
+        }
     }
 }
 

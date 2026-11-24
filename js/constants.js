@@ -48,9 +48,11 @@ export const QUALITY_OPTIONS = [
     { value: "999", label: "无损音质", description: "FLAC" }
 ];
 
+export const DEFAULT_PLAYBACK_QUALITY = "320";
+
 export function normalizeQuality(value) {
     const match = QUALITY_OPTIONS.find(option => option.value === value);
-    return match ? match.value : "320";
+    return match ? match.value : DEFAULT_PLAYBACK_QUALITY;
 }
 
 export const REMOTE_STORAGE_ENDPOINT = "/api/storage";

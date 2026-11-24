@@ -420,6 +420,8 @@ export async function selectPlaybackQuality(quality, state, dom, callbacks = {})
     }
 
     state.playbackQuality = normalized;
+    // 亲手在菜单里选过音质：记下标记，此后默认音质迁移不再覆盖这次选择。
+    safeSetLocalStorage("playbackQualityExplicit", "1");
     updateQualityLabel(state, dom);
     buildQualityMenu(state, dom);
     if (typeof callbacks.savePlayerState === "function") {

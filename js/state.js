@@ -68,7 +68,17 @@ const savedPlayMode = (() => {
     return modes.includes(stored) ? stored : "list";
 })();
 
-const savedPlaybackQuality = normalizeQuality(safeGetLocalStorage("playbackQuality"));
+const savedPlaybackQuality = (() => {
+    const stored = safeGetLocalStorage("playbackQuality");
+    // 一次性迁移：旧版本默认存下的 128（且用户从未在音质菜单里亲手选过）
+    // 改为默认极高音质 320 并写回；亲手选过的（playbackQualityExplicit 标记）
+    // 绝不覆盖，之后再选 128 也能留住。
+    if (stored === "128" && safeGetLocalStorage("playbackQualityExplicit") !== "1") {
+        safeSetLocalStorage("playbackQuality", "320");
+        return "320";
+    }
+    return normalizeQuality(stored);
+})();
 
 const savedVolume = (() => {
     const stored = safeGetLocalStorage("playerVolume");
