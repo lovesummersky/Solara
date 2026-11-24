@@ -9,8 +9,11 @@ import {
     API,
     CUSTOM_APIS_STORAGE_KEY,
     SOLARA_SOURCE_TO_LX_PLATFORM,
+    getScriptPassingSources,
+    hasPassingApiEntry,
     loadCustomApis,
     loadHealthCheckResults,
+    resolveLxProbeInfo,
     saveHealthCheckResult,
     sanitizeCustomApiEntry,
     validateCustomApiUrl,
@@ -23,6 +26,12 @@ export { loadCustomApis, sanitizeCustomApiEntry, validateCustomApiUrl };
 const LX_QUALITY_BY_SOLARA = { "999": "flac", "320": "320k", "192": "320k", "128": "128k" };
 const WORKER_LOAD_TIMEOUT_MS = 20000;
 const MUSIC_URL_TIMEOUT_MS = 15000;
+// 单条检测与总测试同一时间只跑一路：总测试进行中时点条目“检测”不响应，
+// 反之亦然，避免两路并行触发上游并发限制或抢同一个 Worker。
+let detectionRunning = false;
+// 条目检测改动了各音源的逐平台结论后，刷新检测面板药丸的并集显示
+//（initSourceHealthCheck 初始化时登记，面板没初始化过时为空操作）。
+let refreshHealthPills = () => {};
 
 function persist(entries) {
     const clean = entries.map(sanitizeCustomApiEntry).filter(Boolean);
@@ -89,11 +98,11 @@ export async function fetchLxScriptCode(url) {
 }
 
 /** 检测 GD/Meting 兼容 API：发一次真实搜索，返回数组且非空才算可用。 */
-export async function testCustomApi(url) {
+export async function testCustomApi(url, song = "海阔天空") {
     const params = new URLSearchParams({
         types: "search",
         source: "netease",
-        name: "晴天",
+        name: song,
         count: "1",
         pages: "1",
         s: Math.random().toString(36).slice(2),
@@ -257,8 +266,9 @@ export async function getCustomMusicUrl(song, solaraQuality = "320") {
     return null;
 }
 
-/** 检测单个 lx-script：按脚本上报的平台逐个实测《晴天》128k 解析，顺序测（避免并行触发上游限制）。
- * 探针统一用网易云 ID：按名/歌手解析的后端能测到，需要平台原生 ID 的后端可能误报失败，
+/** 检测单个 lx-script：按脚本上报的平台逐个实测检测歌曲 128k 解析，顺序测（避免并行触发上游限制）。
+ * 探针用检测歌曲在网易云的真实搜索结果（id/歌名/歌手）；搜不到时回落默认《晴天》探针，
+ * 并在返回里注明 songFallback，调用方须写进状态文字。需要平台原生 ID 的后端可能误报失败，
  * 因此结果只代表“这首探针歌在这条脚本各平台的实测”，不代表该平台彻底不可用。
  * 只要加载/注册失败才抛错；各平台成败都记在 results 里返回，由调用方汇总。 */
 const LX_PROBE_MUSIC_INFO = {
@@ -275,7 +285,7 @@ const LX_PROBE_MUSIC_INFO = {
 };
 const LX_PROBE_QUALITY = "128k";
 
-export async function testLxScript(entry) {
+export async function testLxScript(entry, song = "海阔天空") {
     const record = await ensureLxWorker(entry);
     const sources = record.config && record.config.sources && typeof record.config.sources === "object"
         ? record.config.sources
@@ -285,18 +295,63 @@ export async function testLxScript(entry) {
         return !Array.isArray(actions) || actions.includes("musicUrl");
     });
     const probeList = platforms.length > 0 ? platforms : ["wy"];
+    const probe = await resolveLxProbeInfo((...args) => API.search(...args), song, LX_PROBE_MUSIC_INFO);
     const results = [];
     for (const platform of probeList) {
         const name = (sources[platform] && sources[platform].name) || platform;
         try {
-            const url = await requestMusicUrlFromWorker(record, platform, LX_PROBE_MUSIC_INFO, LX_PROBE_QUALITY);
+            const url = await requestMusicUrlFromWorker(record, platform, probe.musicInfo, LX_PROBE_QUALITY);
             results.push({ platform, name, ok: true, sampleUrl: url.slice(0, 60) + "…" });
         } catch (err) {
             results.push({ platform, name, ok: false, error: (err && err.message) || "解析失败" });
         }
     }
     const passedCount = results.filter((r) => r.ok).length;
-    return { ok: passedCount > 0, config: record.config, results, passedCount, totalCount: results.length };
+    return { ok: passedCount > 0, config: record.config, results, passedCount, totalCount: results.length, songName: probe.songName, songFallback: probe.fallback };
+}
+
+/** 检测一条已添加的音源（脚本逐平台解析，或接口网易云搜索），用的是检测面板里填的
+ * 同一首检测歌曲。内部处理全部失败分支并写回存储，返回摘要供调用方通知；
+ * 调用方负责重新渲染列表。 */
+async function runEntryDetection(entry, song) {
+    try {
+        if (entry.kind === "lx-script") {
+            terminateWorker(entry.id);
+            const result = await testLxScript(entry, song);
+            const passed = result.passedCount;
+            const total = result.totalCount;
+            const firstFailed = result.results.find((r) => !r.ok);
+            let statusMessage = `逐平台检测《${result.songName}》128k：${passed}/${total} 个平台通过`;
+            if (result.songFallback) statusMessage += `（未搜到《${song}》，改用《${result.songName}》探针）`;
+            if (firstFailed) statusMessage += `；${firstFailed.name}：${String(firstFailed.error || "").slice(0, 60)}`;
+            updateCustomApi(entry.id, {
+                status: passed === total ? "ok" : passed === 0 ? "error" : "partial",
+                statusMessage,
+                platformResults: result.results.map((r) => ({ platform: r.platform, name: r.name, ok: r.ok })),
+                lastTestedAt: Date.now(),
+            });
+            return { summary: `检测完成：${passed}/${total} 个平台通过`, type: passed === total ? "success" : passed === 0 ? "error" : "warning" };
+        }
+        const result = await testCustomApi(entry.url, song);
+        updateCustomApi(entry.id, {
+            status: "ok",
+            statusMessage: `检测（网易云《${song}》搜索）通过，示例：${result.sample}`,
+            lastTestedAt: Date.now(),
+        });
+        return { summary: `检测（网易云《${song}》搜索）通过`, type: "success" };
+    } catch (err) {
+        // 逐平台检测里各平台成败已记在结果中，不会走到这里；到这里的是脚本加载/注册失败，
+        // 或接口检测失败。接口检测只测网易云搜索，写明测的是什么。
+        const failMessage = entry.kind === "lx-script"
+            ? `检测失败：${err.message || "脚本加载失败"}`
+            : `检测（网易云《${song}》搜索）失败：${err.message || "检测失败"}`;
+        updateCustomApi(entry.id, {
+            status: "error",
+            statusMessage: failMessage,
+            lastTestedAt: Date.now(),
+        });
+        return { summary: failMessage, type: "error" };
+    }
 }
 
 /* ---------------- 设置面板 UI ---------------- */
@@ -314,7 +369,8 @@ function statusText(entry) {
     return "尚未检测";
 }
 
-/* ---- 音源检测面板：对当前生效上游的每个平台实测一次搜索（歌曲可自定义，默认《海阔天空》） ---- */
+/* ---- 音源检测面板：总测试——先对当前生效上游的每个平台实测一次搜索，
+ * 再按顺序检测上面每条已启用的音源；两段用的都是下面输入框里填的同一首检测歌曲 ---- */
 const HEALTH_CHECK_SOURCES = [
     { value: "netease", label: "网易云" },
     { value: "tencent", label: "QQ音乐" },
@@ -344,6 +400,14 @@ function loadHealthCheckSong() {
     }
 }
 
+// 条目检测（上面每条音源单独的“检测”）与总测试共用下面输入框里填的同一首检测歌曲：
+// 读输入框的实时值，顺手存下来，下次打开面板直接显示同一首。
+function getSharedTestSong(dom) {
+    const song = getHealthCheckSong(dom);
+    safeSetLocalStorage(HEALTH_CHECK_SONG_STORAGE_KEY, song);
+    return song;
+}
+
 async function probeSourceHealth(source, song) {
     const now = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
     const start = now();
@@ -365,17 +429,42 @@ async function probeSourceHealth(source, song) {
 function renderSourceHealth(dom, results, running) {
     const listEl = dom.sourceHealthList;
     if (!listEl) return;
+    // 药丸取并集：上游实测通过显示秒数；上游没通过、但上面某条已启用音源
+    // 检测通过了该平台，也显示正常（“可用”），因为只要有一个音源能通过就行。
+    // 接口类条目只测网易云搜索，只计入网易云。
+    const scriptPassing = getScriptPassingSources(loadCustomApis());
+    const apiNeteaseOk = hasPassingApiEntry(loadCustomApis());
     listEl.innerHTML = HEALTH_CHECK_SOURCES.map((source) => {
         const result = (results || {})[source.value];
+        const viaOtherSource = scriptPassing.has(source.value) || (source.value === "netease" && apiNeteaseOk);
+        let state;
+        let suffix;
+        if (running === source.value) {
+            state = "pending";
+            suffix = "检测中…";
+        } else if (result && result.state === "ok") {
+            state = "ok";
+            suffix = result.text;
+        } else if (viaOtherSource) {
+            state = "ok";
+            suffix = "可用";
+        } else if (result) {
+            state = result.state;
+            suffix = result.text;
+        } else if (running === true) {
+            state = "pending";
+            suffix = "检测中…";
+        } else {
+            state = "unknown";
+            suffix = "未检测";
+        }
         // running 为 true 表示全量检测进行中（未出结果的显示“检测中…”）；
         // running 为某个平台 value 时表示总测试正在测它，该项优先显示“检测中…”。
-        const state = running === source.value ? "pending" : (result ? result.state : (running === true ? "pending" : "unknown"));
-        const suffix = running === source.value ? "检测中…" : (result ? result.text : (running === true ? "检测中…" : "未检测"));
         return `<span class="source-health-pill is-${state}"><span class="source-health-dot"></span>${escapeHtml(source.label)} ${escapeHtml(suffix)}</span>`;
     }).join("");
 }
 
-function initSourceHealthCheck(dom, state, refreshSourceMenu = () => {}) {
+function initSourceHealthCheck(dom, state, { refreshSourceMenu = () => {}, notify = () => {} } = {}) {
     const btn = dom.sourceHealthCheckBtn;
     const listEl = dom.sourceHealthList;
     if (!btn || !listEl || btn.__healthBound) return;
@@ -406,23 +495,41 @@ function initSourceHealthCheck(dom, state, refreshSourceMenu = () => {}) {
         });
     }
     renderSourceHealth(dom, results, false);
-    // 只有总测试：点“开始检测”把全部平台逐个测一遍，不再支持单点某个音源单独测。
+    refreshHealthPills = () => renderSourceHealth(dom, results, false);
+    // 总测试：先把全部平台逐个测一遍（不再支持单点某个音源单独测），
+    // 再按顺序检测上面每条已启用的音源，用的都是下面输入框里填的同一首检测歌曲。
     btn.addEventListener("click", async () => {
-        if (btn.disabled) return;
+        if (btn.disabled || detectionRunning) return;
+        detectionRunning = true;
         btn.disabled = true;
         btn.textContent = "检测中…";
-        const song = commitSong();
-        // 逐个测：并行 7 路会触发上游并发限制（实测 503），逐个测结果才准。
-        // 每轮只把正在测的那一项标为“检测中…”，其余显示已有结果或“未检测”，
-        // 一眼就能看出当前正在测哪一个平台。
-        for (const source of HEALTH_CHECK_SOURCES) {
-            renderSourceHealth(dom, results, source.value);
-            const result = await probeSourceHealth(source.value, song);
-            applyHealthResult(source, result);
+        try {
+            const song = commitSong();
+            // 逐个测：并行 7 路会触发上游并发限制（实测 503），逐个测结果才准。
+            // 每轮只把正在测的那一项标为“检测中…”，其余显示已有结果或“未检测”，
+            // 一眼就能看出当前正在测哪一个平台。
+            for (const source of HEALTH_CHECK_SOURCES) {
+                renderSourceHealth(dom, results, source.value);
+                const result = await probeSourceHealth(source.value, song);
+                applyHealthResult(source, result);
+            }
+            renderSourceHealth(dom, results, false);
+            // 第二段：上面填写的每条已启用音源，用同一首检测歌曲逐条检测；每测完一条
+            // 就刷新一次列表，卡片状态实时更新。
+            const entries = loadCustomApis().filter((e) => e.enabled);
+            for (const entry of entries) {
+                await runEntryDetection(entry, song);
+                renderCustomApiList(dom);
+                refreshSourceMenu();
+            }
+            // 条目重测可能改变并集结论，最后再刷新一次药丸显示。
+            renderSourceHealth(dom, results, false);
+            if (entries.length > 0) notify(`总检测完成：已检测 ${entries.length} 条音源`, "info");
+        } finally {
+            detectionRunning = false;
+            btn.disabled = false;
+            btn.textContent = "重新检测";
         }
-        renderSourceHealth(dom, results, false);
-        btn.disabled = false;
-        btn.textContent = "重新检测";
     });
 }
 
@@ -488,7 +595,7 @@ export function initCustomApiSettings(dom, state, { showNotification } = {}) {
         buildSourceMenu(state, dom);
         updateSourceLabel(state, dom);
     };
-    initSourceHealthCheck(dom, state, refreshSourceMenu);
+    initSourceHealthCheck(dom, state, { refreshSourceMenu, notify });
 
     addBtn.addEventListener("click", async () => {
         const rawUrl = dom.customApiUrlInput ? dom.customApiUrlInput.value : "";
@@ -528,7 +635,7 @@ export function initCustomApiSettings(dom, state, { showNotification } = {}) {
                     // 只代表“识别出脚本且有 musicUrl 能力”，不代表今天能解析出地址：
                     // 上游经常失效，是否可用以“检测”按钮的真实解析结果为准。
                     status: "unknown",
-                    statusMessage: "已识别为洛雪音源脚本；点“检测”用《晴天》逐个平台实测解析，通过才算可用",
+                    statusMessage: "已识别为洛雪音源脚本；点“检测”用下方检测歌曲逐个平台实测解析，通过才算可用",
                     meta: {
                         name: meta.name || name,
                         version: meta.version || "",
@@ -540,7 +647,7 @@ export function initCustomApiSettings(dom, state, { showNotification } = {}) {
                     lastTestedAt: Date.now(),
                 });
             } else {
-                const result = await testCustomApi(checked.url);
+                const result = await testCustomApi(checked.url, getSharedTestSong(dom));
                 entry = sanitizeCustomApiEntry({
                     ...entry,
                     status: "ok",
@@ -600,48 +707,19 @@ export function initCustomApiSettings(dom, state, { showNotification } = {}) {
             return;
         }
         if (action === "test") {
+            if (detectionRunning) return;
+            detectionRunning = true;
             btn.disabled = true;
-            const original = btn.textContent;
             btn.textContent = "检测中…";
             try {
-                if (entry.kind === "lx-script") {
-                    terminateWorker(id);
-                    const result = await testLxScript(entry);
-                    const passed = result.passedCount;
-                    const total = result.totalCount;
-                    const firstFailed = result.results.find((r) => !r.ok);
-                    let statusMessage = `逐平台检测《晴天》128k：${passed}/${total} 个平台通过`;
-                    if (firstFailed) statusMessage += `；${firstFailed.name}：${String(firstFailed.error || "").slice(0, 60)}`;
-                    updateCustomApi(id, {
-                        status: passed === total ? "ok" : passed === 0 ? "error" : "partial",
-                        statusMessage,
-                        platformResults: result.results.map((r) => ({ platform: r.platform, name: r.name, ok: r.ok })),
-                        lastTestedAt: Date.now(),
-                    });
-                    notify(`检测完成：${passed}/${total} 个平台通过`, passed === total ? "success" : passed === 0 ? "error" : "warning");
-                } else {
-                    const result = await testCustomApi(entry.url);
-                    updateCustomApi(id, {
-                        status: "ok",
-                        statusMessage: `检测（网易云《晴天》搜索）通过，示例：${result.sample}`,
-                        lastTestedAt: Date.now(),
-                    });
-                    notify("检测（网易云《晴天》搜索）通过", "success");
-                }
-            } catch (err) {
-                // 逐平台检测里各平台成败已记在结果中，不会走到这里；到这里的是脚本加载/注册失败，
-                // 或接口检测失败。接口检测仍只测网易云《晴天》搜索，写明测的是什么。
-                const failMessage = entry.kind === "lx-script"
-                    ? `检测失败：${err.message || "脚本加载失败"}`
-                    : `检测（网易云《晴天》搜索）失败：${err.message || "检测失败"}`;
-                updateCustomApi(id, {
-                    status: "error",
-                    statusMessage: failMessage,
-                    lastTestedAt: Date.now(),
-                });
-                notify(failMessage, "error");
+                // 单独检测用的也是下面检测面板里填的同一首检测歌曲。
+                const outcome = await runEntryDetection(entry, getSharedTestSong(dom));
+                notify(outcome.summary, outcome.type);
             } finally {
+                detectionRunning = false;
                 renderCustomApiList(dom);
+                refreshSourceMenu();
+                refreshHealthPills();
             }
         }
     });

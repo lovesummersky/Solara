@@ -249,6 +249,30 @@ export function saveHealthCheckResult(source, state) {
 }
 
 /**
+ * 各条已启用洛雪脚本逐平台检测通过的平台（面板的平台口径：wy/tx/kg/kw/mg
+ * 对应网易云/QQ/酷狗/酷我/咪咕；JOOX/哔哩哔哩没有脚本平台）。
+ * 检测面板药丸与主界面下拉都用它取并集：只要有一处通过，该平台就算可用。
+ */
+const LX_PLATFORM_TO_PANEL_SOURCE = { wy: "netease", tx: "tencent", kg: "kugou", kw: "kuwo", mg: "migu" };
+export function getScriptPassingSources(entries) {
+    const passing = new Set();
+    for (const entry of entries || []) {
+        if (entry.kind !== "lx-script" || !entry.enabled || !Array.isArray(entry.platformResults)) continue;
+        for (const record of entry.platformResults) {
+            if (record && record.ok === true && LX_PLATFORM_TO_PANEL_SOURCE[record.platform]) {
+                passing.add(LX_PLATFORM_TO_PANEL_SOURCE[record.platform]);
+            }
+        }
+    }
+    return passing;
+}
+
+/** 是否有已启用的接口类条目检测通过（接口检测只测网易云搜索，只计入网易云）。 */
+export function hasPassingApiEntry(entries) {
+    return (entries || []).some((e) => e.kind === "api" && e.enabled && e.status === "ok");
+}
+
+/**
  * 主界面音源下拉的可见选项：没测过的平台照常显示；检测出“没有音源”（失败或
  * 无结果）的平台不显示——除非某条已启用的洛雪脚本逐平台检测通过了它（脚本能
  * 解析该平台的播放地址），这时也显示。两者取并集：只要有一处通过就显示。
@@ -257,16 +281,7 @@ export function saveHealthCheckResult(source, state) {
  */
 export function getVisibleSourceOptions() {
     const results = loadHealthCheckResults();
-    const lxToDropdown = { wy: "netease", tx: "tencent", kw: "kuwo" };
-    const scriptPassing = new Set();
-    for (const entry of loadCustomApis()) {
-        if (entry.kind !== "lx-script" || !entry.enabled || !Array.isArray(entry.platformResults)) continue;
-        for (const record of entry.platformResults) {
-            if (record && record.ok === true && lxToDropdown[record.platform]) {
-                scriptPassing.add(lxToDropdown[record.platform]);
-            }
-        }
-    }
+    const scriptPassing = getScriptPassingSources(loadCustomApis());
     const visible = SOURCE_OPTIONS.filter((option) => {
         const state = results[option.value];
         if (state !== "error" && state !== "empty") return true;
@@ -587,3 +602,52 @@ export const API = {
 };
 
 Object.freeze(API);
+
+/**
+ * 脚本逐平台检测的探针：按检测歌曲名在网易云搜一条真实结果，用它的 id/歌名/歌手
+ * 作探针（脚本后端按平台原生 ID 解析，写死一首歌的 ID 会与歌名对不上）。
+ * 搜不到或搜索失败时回落到给定的默认探针，调用方须在状态文字里注明改用了默认探针。
+ * searchFn 由调用方传入（默认用 API.search），便于隔离测试。
+ */
+export function buildLxProbeMusicInfo(first, song) {
+    const id = first && (first.id ?? first.songmid ?? first.hash);
+    if (first && id != null && String(id) !== "") {
+        const sid = String(id);
+        const artist = first.artist || first.singer || "";
+        return {
+            musicInfo: {
+                id: sid,
+                songmid: sid,
+                hash: sid,
+                name: first.name || song,
+                singer: artist,
+                artist,
+                albumName: "",
+                album: "",
+                duration: 0,
+                pic: "",
+            },
+            songName: first.name || song,
+        };
+    }
+    return null;
+}
+
+export async function resolveLxProbeInfo(searchFn, song, fallbackMusicInfo, timeoutMs = 10000) {
+    const fallback = {
+        musicInfo: { ...fallbackMusicInfo },
+        songName: fallbackMusicInfo.name,
+        fallback: true,
+    };
+    try {
+        const data = await Promise.race([
+            searchFn(song, "netease", 1, 1),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("解析检测歌曲超时")), timeoutMs)),
+        ]);
+        const built = Array.isArray(data) ? buildLxProbeMusicInfo(data[0], song) : null;
+        if (built) return { ...built, fallback: false };
+    } catch (_) {
+        // 搜不到/超时都回落默认探针，不抛错。
+    }
+    return fallback;
+}
