@@ -63,7 +63,8 @@ import {
     closeSourceMenu,
     toggleSourceMenu,
     handlePlayerQualitySelection,
-    handleSourceSelection
+    handleSourceSelection,
+    selectSearchSource
 } from "./core/quality.js";
 import {
     getSongKey,
@@ -126,6 +127,7 @@ import {
     cancelPendingPlayback
 } from "./core/audio.js";
 import { initMediaSession } from "./core/media-session.js";
+import { initViews } from "./features/views.js";
 
 const debugLog = createDebugLogger(state, dom);
 initDebugShortcut(state, dom, debugLog);
@@ -384,6 +386,151 @@ export async function playSearchResult(index) {
     }
 }
 
+/**
+ * 新界面壳子（榜单/发现/历史）播放外部歌曲：与播放搜索结果同一链路——
+ * 歌曲先并入播放列表（按 id+来源去重），再走同一 playSong，避免两套播放逻辑。
+ */
+async function playExternalSong(song, options = {}) {
+    if (!song) return;
+    let existingIndex = state.playlistSongs.findIndex(s => getSongKey(s) === getSongKey(song));
+    if (existingIndex !== -1) {
+        state.currentTrackIndex = existingIndex;
+    } else {
+        state.playlistSongs.push(song);
+        state.currentTrackIndex = state.playlistSongs.length - 1;
+        renderPlaylist(state, dom, getPlaylistCallbacks());
+    }
+    state.currentPlaylist = "playlist";
+    state.currentList = "playlist";
+    savePlayerState();
+    try {
+        await playSong(song, options, state, dom, getAudioCallbacks(), debugLog);
+        updatePlaylistHighlight(state, dom);
+        updatePlayModeUI(state, dom);
+    } catch (error) {
+        console.error("播放失败:", error);
+        showNotification("播放失败，请稍后重试", "error", dom);
+    }
+}
+
+/** 播放外部整列歌曲（榜单“播放全部”）：去重并入播放列表，从 startIndex 指定的那首开始播。 */
+async function playExternalList(songs, startIndex = 0) {
+    const list = Array.isArray(songs) ? songs.filter(Boolean) : [];
+    if (list.length === 0) return;
+    for (const song of list) {
+        if (state.playlistSongs.findIndex(s => getSongKey(s) === getSongKey(song)) === -1) {
+            state.playlistSongs.push(song);
+        }
+    }
+    savePlayerState();
+    renderPlaylist(state, dom, getPlaylistCallbacks());
+    const target = list[Math.max(0, Math.min(startIndex, list.length - 1))];
+    const idx = state.playlistSongs.findIndex(s => getSongKey(s) === getSongKey(target));
+    if (idx !== -1) {
+        await playPlaylistSong(idx);
+    }
+}
+
+/** “存为歌单”：用外部整列歌曲替换当前播放列表（不自动播放）。 */
+function replacePlaylistWith(songs) {
+    const list = Array.isArray(songs) ? songs.filter(Boolean) : [];
+    state.playlistSongs = list.slice();
+    state.currentTrackIndex = -1;
+    savePlayerState();
+    renderPlaylist(state, dom, getPlaylistCallbacks());
+    updatePlaylistHighlight(state, dom);
+}
+
+/** 仅追加到播放列表（不切歌），供榜单行内“+”使用。 */
+function appendToPlaylist(songs) {
+    const list = Array.isArray(songs) ? songs.filter(Boolean) : [];
+    let added = 0;
+    for (const song of list) {
+        if (state.playlistSongs.findIndex(s => getSongKey(s) === getSongKey(song)) === -1) {
+            state.playlistSongs.push(song);
+            added += 1;
+        }
+    }
+    if (added > 0) {
+        savePlayerState();
+        renderPlaylist(state, dom, getPlaylistCallbacks());
+        showNotification(`已添加 ${added} 首到播放列表`, "success", dom);
+    } else {
+        showNotification("歌曲已在播放列表中", "info", dom);
+    }
+}
+
+/** 榜单“批量下载”：与播放列表“下载全部”同一逐首下载链路、同一当前音质。 */
+async function downloadExternalSongs(songs) {
+    const list = Array.isArray(songs) ? songs.filter(Boolean) : [];
+    if (list.length === 0) {
+        showNotification("没有可下载的歌曲", "warning", dom);
+        return;
+    }
+    showNotification(`开始下载 ${list.length} 首歌曲，请在浏览器里允许“多个文件下载”…`, "info", dom);
+    try {
+        const result = await downloadSongsSequentially(list, state.playbackQuality, dom, (done, total, song) => {
+            debugLog(`[榜单下载] ${done}/${total}：${song?.name || ""}`);
+        });
+        if (result.failed === 0) {
+            showNotification(`全部下载已开始，共 ${result.succeeded} 首`, "success", dom);
+        } else {
+            showNotification(`下载完成：成功 ${result.succeeded} 首，失败 ${result.failed} 首（已跳过）`, "warning", dom);
+        }
+    } catch (error) {
+        console.error("榜单批量下载失败:", error);
+        showNotification("批量下载失败，请稍后重试", "error", dom);
+    }
+}
+
+/**
+ * 播不了就跳下一首（用户要求）：某首歌取不到播放地址/加载失败时，自动试列表里的
+ * 下一首，而不是停住。跳过的歌记在同一条链里（随 options 传递），整列都试过
+ * 就停下并提示，不循环。单曲循环模式下也强制往后跳，否则会死磕同一首播不了的歌。
+ * 返回 true 表示已接管（调用方不再弹通用失败提示）。
+ */
+function skipUnplayableSong(failedSong, chain, reason) {
+    const isFavorite = state.currentList === "favorite";
+    const list = isFavorite ? ensureFavoriteSongsArray(state) : state.playlistSongs;
+    if (!Array.isArray(list) || list.length === 0) return false;
+
+    const skipChain = chain instanceof Set ? chain : new Set();
+    skipChain.add(getSongKey(failedSong));
+
+    const allTried = list.every((s) => skipChain.has(getSongKey(s)));
+    if (allTried) {
+        showNotification(
+            reason === "trial-clip" ? "列表里的歌曲都只有试听片段，已停止" : "列表里的歌曲都无法播放，已停止",
+            "error", dom);
+        return true;
+    }
+
+    const currentIndex = isFavorite ? state.currentFavoriteIndex : state.currentTrackIndex;
+    let nextIndex = -1;
+    for (let i = 1; i <= list.length; i++) {
+        const candidate = (currentIndex + i) % list.length;
+        if (candidate < 0) continue;
+        if (!skipChain.has(getSongKey(list[candidate]))) {
+            nextIndex = candidate;
+            break;
+        }
+    }
+    if (nextIndex === -1) return false;
+
+    showNotification(
+        reason === "trial-clip"
+            ? `《${failedSong?.name || "这首歌"}》只找到试听片段，已跳到下一首`
+            : `《${failedSong?.name || "这首歌"}》无法播放，已跳到下一首`,
+        "info", dom);
+    const opts = { autoSkipChain: skipChain };
+    if (isFavorite) {
+        playFavoriteSong(nextIndex, opts);
+    } else {
+        playPlaylistSong(nextIndex, opts);
+    }
+    return true;
+}
+
 function getAudioCallbacks() {
     return {
         updateCurrentSongInfo,
@@ -394,6 +541,7 @@ function getAudioCallbacks() {
         playPlaylistSong,
         playFavoriteSong,
         playSearchResult,
+        onPlaybackFailed: (song, chain, reason) => skipUnplayableSong(song, chain, reason),
         scheduleDeferredSongAssets: (song, playPromise) => {
             const run = () => {
                 if (state.currentSong !== song) return;
@@ -627,6 +775,9 @@ export async function exploreOnlineMusic() {
             album: song.album || "",
             source: song.source || "netease",
             lyric_id: song.lyric_id || song.id,
+            // dt/duration 必须保留：播放器靠全长判断解析出的地址是不是试听片段。
+            dt: song.dt,
+            duration: song.duration,
             pic: song.pic || "",
             pic_id: song.pic_id || "",
             url_id: song.url_id || song.id,
@@ -998,10 +1149,16 @@ function setupEventHandlers() {
             const removeBtn = e.target.closest(".playlist-item-remove");
             const favBtn = e.target.closest(".playlist-item-favorite");
             const dlBtn = e.target.closest(".playlist-item-download");
+            const playBtn = e.target.closest(".playlist-item-play");
 
             // 1. 若点击命中操作容器槽或具体某个按钮
-            if (actionContainer || removeBtn || favBtn || dlBtn) {
+            if (actionContainer || removeBtn || favBtn || dlBtn || playBtn) {
                 e.stopPropagation();
+
+                if (playBtn) {
+                    playPlaylistSong(index);
+                    return;
+                }
 
                 if (removeBtn) {
                     removeFromPlaylist(index, state, dom, getPlaylistCallbacks());
@@ -1360,7 +1517,11 @@ function setupEventHandlers() {
         }
 
         // 若点击发生在搜索核心控件内部，不关闭
+        // 新界面壳子：顶栏与底部播放栏是常驻控制面，点击它们也不收起搜索
+        // （搜索改由右上角关闭按钮、Esc 或侧栏导航离开时收起）。
         if (e.target.closest(".search-controls-wrapper") ||
+            e.target.closest(".app-topbar") ||
+            e.target.closest(".app-playerbar") ||
             e.target.closest(".source-menu") ||
             e.target.closest(".import-dropdown-menu") ||
             e.target.closest(".quality-menu")) {
@@ -1424,6 +1585,24 @@ window.playNext = () => playNext(state, dom, getAudioCallbacks());
 window.playPrevious = () => playPrevious(state, dom, getAudioCallbacks());
 window.autoPlayNext = () => autoPlayNext(state, dom, getAudioCallbacks());
 window.restoreLastSearchResults = (options = { showView: true }) => restoreLastSearchResults(state, dom, getSearchCallbacks(), options);
+
+// 新界面壳子（views.js）与主应用之间的唯一桥梁：视图层不直接碰 state/dom，
+// 只通过这里暴露的受控操作走同一链路，避免两套状态逻辑。
+window.SolaraViewsBridge = {
+    setSearchSource: (value) => selectSearchSource(value, state, dom, {
+        showNotification: (msg, type) => showNotification(msg, type, dom),
+    }),
+    getSearchSource: () => state.searchSource,
+    getCurrentSong: () => state.currentSong || null,
+    getPlaybackQuality: () => state.playbackQuality,
+    playExternalSong,
+    playExternalList,
+    replacePlaylistWith,
+    appendToPlaylist,
+    downloadExternalSongs,
+    toggleFavoriteSong: (song) => toggleFavorite(song, state, dom, { saveFavoriteState }),
+    notify: (msg, type) => showNotification(msg, type, dom),
+};
 
 // 从云端 D1 数据库应用快照至本地应用状态与 UI
 export async function applyPersistentSnapshotFromRemote(data) {
@@ -1645,6 +1824,9 @@ export async function bootstrap() {
 
     setupEventHandlers();
     initTheme(dom, state);
+    // 新界面壳子（侧栏/视图/播放栏/歌词浮层）：必须在恢复上次搜索之前初始化，
+    // 恢复流程里的 show/hide 搜索会通过它切视图。
+    initViews();
     initSettings(dom, state, { debugLog, manualSync: handleManualCloudSync });
     initSpotlightEffect();
     initMediaSession(state, dom, {

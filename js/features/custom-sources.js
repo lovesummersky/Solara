@@ -229,15 +229,14 @@ function requestMusicUrlFromWorker(record, platform, musicInfo, quality) {
  * wy/kw 等平台；joox/bilibili 没有对应平台，直接跳过）。
  * 全部失败返回 null，调用方回落到默认 /proxy，绝不抛错中断播放。
  */
-export async function getCustomMusicUrl(song, solaraQuality = "320") {
-    if (!song || typeof song !== "object") return null;
-    const platform = SOLARA_SOURCE_TO_LX_PLATFORM[song.source || "netease"];
-    if (!platform) return null;
-    const entries = loadCustomApis().filter((e) => e.kind === "lx-script" && e.enabled);
-    if (entries.length === 0) return null;
+/** 已启用的洛雪脚本条目（播放链按此顺序逐条尝试）。 */
+export function getEnabledLxScriptEntries() {
+    return loadCustomApis().filter((e) => e.kind === "lx-script" && e.enabled);
+}
 
+function buildLxMusicInfo(song) {
     const artist = Array.isArray(song.artist) ? song.artist.join(" / ") : (song.artist || "");
-    const musicInfo = {
+    return {
         id: song.id,
         songmid: song.id,
         hash: song.id,
@@ -249,19 +248,40 @@ export async function getCustomMusicUrl(song, solaraQuality = "320") {
         duration: 0,
         pic: song.pic || "",
     };
+}
+
+/**
+ * 只用某一条脚本解析播放地址（失败/超时/该脚本不支持此平台时返回 null，
+ * 绝不抛错打断调用方的逐条尝试）。
+ */
+export async function resolveMusicUrlFromEntry(entry, song, solaraQuality = "320") {
+    if (!song || typeof song !== "object" || !entry) return null;
+    const platform = SOLARA_SOURCE_TO_LX_PLATFORM[song.source || "netease"];
+    if (!platform) return null;
     const quality = LX_QUALITY_BY_SOLARA[String(solaraQuality)] || "320k";
+    try {
+        const record = await ensureLxWorker(entry);
+        // 脚本上报的平台里没有当前平台时跳过（上报缺失时不拦截，照常尝试）。
+        const sources = record.config && record.config.sources;
+        if (sources && typeof sources === "object" && !sources[platform]) return null;
+        const url = await requestMusicUrlFromWorker(record, platform, buildLxMusicInfo(song), quality);
+        return url || null;
+    } catch (err) {
+        console.warn(`自定义音源解析失败 [${entry.meta?.name || entry.url}]:`, err);
+        return null;
+    }
+}
+
+export async function getCustomMusicUrl(song, solaraQuality = "320") {
+    if (!song || typeof song !== "object") return null;
+    const platform = SOLARA_SOURCE_TO_LX_PLATFORM[song.source || "netease"];
+    if (!platform) return null;
+    const entries = getEnabledLxScriptEntries();
+    if (entries.length === 0) return null;
 
     for (const entry of entries) {
-        try {
-            const record = await ensureLxWorker(entry);
-            // 脚本上报的平台里没有当前平台时跳过（上报缺失时不拦截，照常尝试）。
-            const sources = record.config && record.config.sources;
-            if (sources && typeof sources === "object" && !sources[platform]) continue;
-            const url = await requestMusicUrlFromWorker(record, platform, musicInfo, quality);
-            if (url) return url;
-        } catch (err) {
-            console.warn(`自定义音源解析失败 [${entry.meta?.name || entry.url}]:`, err);
-        }
+        const url = await resolveMusicUrlFromEntry(entry, song, solaraQuality);
+        if (url) return url;
     }
     return null;
 }

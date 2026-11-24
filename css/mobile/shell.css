@@ -1,0 +1,235 @@
+/**
+ * 新界面壳子 · 移动端适配：侧栏变抽屉、顶栏收紧、播放栏贴底、歌词浮层单列。
+ * 本文件由 css/mobile.css 最后引入，覆盖 shell.css 的桌面布局。
+ */
+
+/* 移动端不显示旧版顶部工具栏，统一用新顶栏 */
+html.mobile-view #mainContainer .mobile-toolbar {
+    display: none;
+}
+
+html.mobile-view body {
+    padding: 0;
+}
+
+html.mobile-view #mainContainer.container {
+    width: 100vw;
+    height: 100dvh;
+    min-height: 0;
+    max-height: none;
+    border-radius: 0;
+    border: none;
+}
+
+html.mobile-view #mainContainer .app-shell {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+html.mobile-view #mainContainer .app-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 260;
+    width: min(300px, 84vw);
+    background: var(--shell-card);
+    box-shadow: 0 0 60px rgba(0, 0, 0, 0.35);
+    transform: translateX(-105%);
+    transition: transform 0.26s ease;
+}
+
+html.mobile-view #mainContainer .app-sidebar.open {
+    transform: translateX(0);
+}
+
+html.mobile-view #mainContainer .sidebar-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 250;
+    background: rgba(0, 0, 0, 0.42);
+    border: none;
+    padding: 0;
+}
+
+html.mobile-view #mainContainer .sidebar-scrim[hidden] {
+    display: none;
+}
+
+html.mobile-view #mainContainer .sidebar-toggle-btn {
+    display: inline-flex;
+}
+
+html.mobile-view #mainContainer .app-topbar {
+    gap: 8px;
+    padding: 10px 12px;
+    flex-wrap: wrap;
+}
+
+html.mobile-view .topbar-search-slot {
+    order: 1;
+    flex-basis: 100%;
+}
+
+html.mobile-view .platform-select-wrap {
+    order: 2;
+}
+
+html.mobile-view .platform-select-label {
+    display: none;
+}
+
+html.mobile-view .platform-select {
+    max-width: 128px;
+    padding: 7px 8px;
+    font-size: 13px;
+}
+
+html.mobile-view .topbar-actions {
+    order: 3;
+    margin-left: auto;
+}
+
+html.mobile-view #mainContainer .app-views {
+    padding: 12px 12px 20px;
+}
+
+html.mobile-view #mainContainer .view[data-view="now-playing"] .main-content {
+    grid-template-columns: minmax(0, 1fr);
+    height: auto;
+}
+
+html.mobile-view .charts-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+html.mobile-view .chart-card {
+    min-height: 112px;
+    padding: 14px;
+}
+
+html.mobile-view .chart-card-name {
+    font-size: 17px;
+}
+
+html.mobile-view .chart-song-row {
+    grid-template-columns: 26px 18px 42px minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 7px 6px;
+}
+
+html.mobile-view .chart-song-duration,
+html.mobile-view .chart-song-singer,
+html.mobile-view .chart-song-played-at {
+    display: none;
+}
+
+html.mobile-view .fulllist-layout {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+html.mobile-view .fulllist-side {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+html.mobile-view .fulllist-side-title {
+    flex-basis: 100%;
+}
+
+html.mobile-view .fulllist-cat {
+    padding: 7px 11px;
+    border: 1px solid var(--shell-border);
+}
+
+html.mobile-view .fulllist-back {
+    margin-top: 0;
+}
+
+html.mobile-view .fulllist-actions {
+    margin-left: 0;
+}
+
+html.mobile-view .detail-actions {
+    margin-left: 0;
+}
+
+/* 移动端播放栏：信息条在上、控制台在下，贴底不悬浮遮挡内容 */
+html.mobile-view #mainContainer .app-playerbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 2px;
+    padding: 8px 10px calc(10px + env(safe-area-inset-bottom));
+}
+
+html.mobile-view .playerbar-strip {
+    flex: none;
+}
+
+html.mobile-view .playerbar-controls-slot .controls {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+}
+
+/* 歌词浮层单列：封面在上、歌词在下滚动 */
+html.mobile-view .lyrics-overlay-grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 8px;
+    padding: 52px 18px 18px;
+}
+
+html.mobile-view .lyrics-overlay-left {
+    gap: 6px;
+}
+
+html.mobile-view .lyrics-overlay-cover-wrap {
+    width: min(150px, 44vw);
+}
+
+html.mobile-view .lyrics-overlay-title {
+    font-size: 19px;
+}
+
+html.mobile-view .lyrics-overlay-transport {
+    gap: 14px;
+}
+
+html.mobile-view .lyrics-overlay-transport .transport-button {
+    width: 44px;
+    height: 44px;
+}
+
+html.mobile-view .lyrics-overlay-transport .transport-button--play {
+    width: 54px;
+    height: 54px;
+}
+
+html.mobile-view .lyrics-overlay-right .lyrics-content {
+    padding: 8px 8px 32vh;
+}
+
+html.mobile-view .lyrics-overlay-right .lyrics-content > div {
+    font-size: 17px;
+}
+
+html.mobile-view .lyrics-overlay-right .lyrics-content > div.current {
+    font-size: 19px;
+}
+
+/* 移动端兜底：正在播放视图的两栏规则不带桌面类前缀，这里把封面卡片恢复为
+   移动端透明居中的样子（mobile.css 只在移动端加载，桌面端不受影响）。 */
+html.mobile-view #mainContainer .view[data-view="now-playing"] .cover-area {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+
+html.mobile-view #mainContainer .view[data-view="now-playing"] .album-cover {
+    width: min(72vw, 300px);
+    height: min(72vw, 300px);
+}

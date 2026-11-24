@@ -7,7 +7,7 @@ import { safeSetLocalStorage, preferHttpsUrl, buildAudioProxyUrl } from "./stora
 import { showNotification } from "../features/settings.js";
 import { getSongKey } from "../features/playlist.js";
 import { ensureFavoriteSongsArray } from "../features/favorites.js";
-import { getCustomMusicUrl } from "../features/custom-sources.js";
+import { getCustomMusicUrl, resolveMusicUrlFromEntry, getEnabledLxScriptEntries } from "../features/custom-sources.js";
 
 export const playModeTexts = {
     "list": "列表循环",
@@ -242,6 +242,118 @@ export function setAudioCurrentTime(time, state, dom) {
     }
 }
 
+/** 歌曲全长（秒）：搜索/榜单/导入结果里带的 duration（秒）或 dt（毫秒）。 */
+function expectedSongDurationSeconds(song) {
+    if (!song || typeof song !== "object") return null;
+    const seconds = Number(song.duration);
+    if (Number.isFinite(seconds) && seconds > 0) return seconds;
+    const dt = Number(song.dt);
+    if (Number.isFinite(dt) && dt > 0) return dt / 1000;
+    return null;
+}
+
+/**
+ * 试听片段判定：实际播出的音频远短于歌曲全长（不到七成）时，判定为
+ * 试听片段。任一时长未知/无效时不判定（不断掉可播的歌）。
+ */
+function isTrialClipDuration(actualDuration, expectedDuration) {
+    if (!Number.isFinite(actualDuration) || actualDuration <= 0) return false;
+    if (!Number.isFinite(expectedDuration) || expectedDuration <= 0) return false;
+    return actualDuration < expectedDuration * 0.7;
+}
+
+const PLATFORM_SHORT_LABELS = {
+    netease: "网易云",
+    tencent: "QQ",
+    kugou: "酷狗",
+    kuwo: "酷我",
+    migu: "咪咕",
+    joox: "JOOX",
+    bilibili: "哔哩哔哩",
+};
+
+/** 歌名/歌手归一化：去空格、大小写与常见标点，便于跨平台比对。 */
+function normalizeSongText(text) {
+    return String(text || "").toLowerCase().replace(/[\s·•・、，,。！!？?：:；;""''「」『』《》〈〉()（）【】[\]{}_~～\-—–]/g, "");
+}
+
+/** 去掉歌名里的括号后缀（Live/伴奏/翻唱标注等），只要主歌名。 */
+function baseSongName(name) {
+    return String(name || "").replace(/[(（\[][^\]）)]*[\]）)]/g, "").trim();
+}
+
+function artistTokens(artist) {
+    const raw = Array.isArray(artist) ? artist.join("/") : String(artist || "");
+    return raw.split(/[/／&,&、,，;；+＋]/).map((t) => normalizeSongText(t)).filter(Boolean);
+}
+
+function artistsMatch(originalArtist, candidateArtist) {
+    const a = artistTokens(originalArtist);
+    const b = artistTokens(candidateArtist);
+    if (a.length === 0 || b.length === 0) return false;
+    return a.some((x) => b.some((y) => x === y || (x.length >= 2 && y.length >= 2 && (x.includes(y) || y.includes(x)))));
+}
+
+/**
+ * 在候选列表里找原歌曲的同名完整版：歌名须对上（严格模式要求全名
+ * 一致；放宽模式允许去掉括号后缀），歌手须对上（避免顶错成翻唱版），
+ * 已知时长时与原全长相差不能过大。返回最佳匹配或 null。
+ */
+function findCrossPlatformSubstitute(original, candidates, strict, origExpectedDuration) {
+    const origName = normalizeSongText(original?.name);
+    const origBase = normalizeSongText(baseSongName(original?.name));
+    const origAlbum = normalizeSongText(original?.album);
+    let best = null;
+    let bestScore = -1;
+    for (const cand of candidates) {
+        if (!cand || !cand.name || !cand.id) continue;
+        if (String(cand.id) === String(original.id) && (cand.source || "") === (original.source || "")) continue;
+        const candName = normalizeSongText(cand.name);
+        const candBase = normalizeSongText(baseSongName(cand.name));
+        const nameExact = origName !== "" && candName === origName;
+        const nameBase = !nameExact && origBase !== "" && candBase === origBase;
+        if (!nameExact && !( !strict && nameBase)) continue;
+        if (!artistsMatch(original.artist, cand.artist)) continue;
+        const candExpected = expectedSongDurationSeconds(cand);
+        if (Number.isFinite(origExpectedDuration) && origExpectedDuration > 0
+            && Number.isFinite(candExpected) && candExpected > 0
+            && (candExpected < origExpectedDuration * 0.6 || candExpected > origExpectedDuration * 1.6)) continue;
+        let score = nameExact ? 2 : 1;
+        if (origAlbum && normalizeSongText(cand.album) === origAlbum) score += 1;
+        if (score > bestScore) {
+            best = cand;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+/**
+ * 跨平台代播：用网易云/酷我搜同名歌曲，找歌名与歌手都对得上的
+ * 完整版（原平台除外）。每个平台最多搜一次，先精确歌名、再放宽。
+ */
+async function findFullVersionSubstitute(song, expectedDuration, log) {
+    const keyword = (song?.name || "").trim();
+    if (!keyword) return null;
+    const platforms = ["netease", "kuwo"].filter((p) => p !== (song.source || "netease"));
+    const searched = [];
+    for (const platform of platforms) {
+        try {
+            const results = await API.searchWithFallback(keyword, platform, 20, 1);
+            if (Array.isArray(results) && results.length > 0) searched.push(results);
+        } catch (err) {
+            console.warn(`[跨平台代播] ${platform} 搜索失败:`, err);
+        }
+    }
+    for (const strict of [true, false]) {
+        for (const results of searched) {
+            const match = findCrossPlatformSubstitute(song, results, strict, expectedDuration);
+            if (match) return { song: match };
+        }
+    }
+    return null;
+}
+
 export function waitForAudioReady(player) {
     if (!player) return Promise.resolve();
     if (player.readyState >= 1) {
@@ -287,82 +399,66 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
             callbacks.updateCurrentSongInfo(song, { loadArtwork: false });
         }
 
+        // 先停掉正在播的上一首并复位进度显示：取新歌地址在下面抛错时，
+        // 旧音频若还响着，标题却已换成新歌，就会“放的是上一首、显示的是新歌”。
+        // 这里先停，失败时保持安静 + 新歌标题 + 报错提示；成功时再正常起播。
+        dom.audioPlayer.pause();
+        state.currentSong = song;
+        state.currentAudioUrl = null;
+        if (dom.progressBar) {
+            dom.progressBar.value = 0;
+            dom.progressBar.max = 0;
+            updateProgressBarBackground(dom, 0, 1);
+        }
+        if (dom.currentTimeDisplay) dom.currentTimeDisplay.textContent = "00:00";
+        if (dom.durationDisplay) dom.durationDisplay.textContent = "00:00";
+
         const quality = state.playbackQuality || '320';
         log(`[音频播放] 准备加载: ${song.name || "未知歌曲"} (音质: ${quality}k, 来源: ${song.source || 'netease'})`);
 
         const cacheKey = `${song.source || 'netease'}_${song.id}_${quality}`;
-        let originalAudioUrl = null;
+        // 试听片段判定用的全长：有全长信息时，解析出的地址若远短于全长
+        // 就换下一个音源接着试，直到播出整首；没有全长信息时不判断。
+        // 跨平台代播的歌曲本身常无全长信息，沿用原歌曲的全长作判断。
+        const ownExpectedDuration = expectedSongDurationSeconds(song);
+        const fallbackExpectedDuration = Number(options.fallbackExpectedDuration);
+        const expectedDuration = ownExpectedDuration
+            ?? (Number.isFinite(fallbackExpectedDuration) && fallbackExpectedDuration > 0 ? fallbackExpectedDuration : null);
 
-        // 1. 优先命中前端内存短期直链缓存（0 网络请求）
-        if (!isRetry && audioUrlMemoryCache.has(cacheKey)) {
-            const cachedItem = audioUrlMemoryCache.get(cacheKey);
-            if (Date.now() - cachedItem.timestamp < AUDIO_URL_CACHE_TTL && cachedItem.url) {
-                originalAudioUrl = cachedItem.url;
-                log(`[音频缓存] 命中内存直链: ${song.name} (${quality}k)，省去 1 次网络请求`);
-            } else {
-                audioUrlMemoryCache.delete(cacheKey);
-            }
-        }
-
-        // 2. 未命中或重试时，先试用户添加的洛雪脚本解析，失败再走默认 /proxy。
-        //    getCustomMusicUrl 内部已吞掉脚本错误并返回 null，绝不中断播放。
-        if (!originalAudioUrl) {
-            try {
-                const customUrl = await getCustomMusicUrl(song, quality);
-                if (customUrl) {
-                    originalAudioUrl = customUrl;
-                    log(`[音频解析] 自定义音源解析成功: ${song.name}`);
-                    audioUrlMemoryCache.set(cacheKey, { url: originalAudioUrl, timestamp: Date.now() });
-                }
-            } catch (err) {
-                console.warn("自定义音源解析异常，回落默认接口:", err);
-            }
-        }
-        if (!originalAudioUrl) {
-            // 播放地址轮询：按“当前上游 → 其他已启用 api → 默认上游”逐个试，
-            // 拿到可播地址即停；全部失败时 audioData 保持 null，走原有抛错流程。
-            let audioData = null;
-            if (isRetry) {
-                log(`[音频重试] 正在通过非缓存链路重试请求...`);
-            }
-            for (const base of getApiFallbackBases()) {
-                let audioUrl = API.getSongUrlWithBase(song, quality, base);
-                if (isRetry) {
-                    audioUrl += '&nocache=true';
-                }
-                log(`[音频解析] 请求接口: ${audioUrl}`);
+        // 试某条解析出的地址：逐个变体加载元数据；只有播出整首（或无法
+        // 判断时长）才算选中。试听片段返回 { clip: true }，由调用方换下
+        // 一个音源；加载失败返回 { error }。
+        const tryLoadCandidate = async (resolvedUrl) => {
+            const proxiedAudioUrl = buildAudioProxyUrl(resolvedUrl);
+            const preferredAudioUrl = preferHttpsUrl(resolvedUrl);
+            const variants = Array.from(
+                new Set([proxiedAudioUrl, preferredAudioUrl, resolvedUrl].filter(Boolean))
+            );
+            let lastError = null;
+            let sawClipVariant = false;
+            for (const candidateUrl of variants) {
+                if (myToken !== currentPlaybackToken) return { superseded: true };
+                dom.audioPlayer.src = candidateUrl;
+                dom.audioPlayer.load();
                 try {
-                    const data = await API.fetchJson(audioUrl);
-                    if (data && data.url) {
-                        audioData = data;
-                        break;
-                    }
-                } catch (err) {
-                    console.warn(`[轮询] 上游 ${base || "默认上游"} 取播放地址失败，尝试下一个音源:`, err);
+                    await waitForAudioReady(dom.audioPlayer);
+                } catch (error) {
+                    lastError = error;
+                    continue;
                 }
+                if (isTrialClipDuration(dom.audioPlayer.duration, expectedDuration)) {
+                    log(`[试听片段] 地址只有 ${Math.round(dom.audioPlayer.duration)} 秒（全长约 ${Math.round(expectedDuration)} 秒），换下一个音源: ${song.name}`);
+                    dom.audioPlayer.pause();
+                    // 同一地址的不同变体可能是同一文件的不同取法：全部变体
+                    // 都短才算试听片段，避免代理取法造成的误判。
+                    sawClipVariant = true;
+                    continue;
+                }
+                return { selectedUrl: candidateUrl, resolvedUrl };
             }
-            if (myToken !== currentPlaybackToken) {
-                return;
-            }
-
-            if (!audioData || !audioData.url) {
-                throw new Error('无法获取音频播放地址');
-            }
-
-            originalAudioUrl = audioData.url;
-            // 存入短期缓存（15分钟有效）
-            audioUrlMemoryCache.set(cacheKey, {
-                url: originalAudioUrl,
-                timestamp: Date.now()
-            });
-        }
-
-        log(`[音频地址] 解析就绪: ${originalAudioUrl.slice(0, 50)}...`);
-        const proxiedAudioUrl = buildAudioProxyUrl(originalAudioUrl);
-        const preferredAudioUrl = preferHttpsUrl(originalAudioUrl);
-        const candidateAudioUrls = Array.from(
-            new Set([proxiedAudioUrl, preferredAudioUrl, originalAudioUrl].filter(Boolean))
-        );
+            if (sawClipVariant) return { clip: true };
+            return { error: lastError || new Error('音频加载失败') };
+        };
 
         state.currentSong = song;
         state.currentAudioUrl = null;
@@ -390,19 +486,88 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
 
         state.pendingSeekTime = startTime > 0 ? startTime : null;
 
+        // 逐个音源解析、逐个验时长：缓存 → 洛雪脚本（启用顺序）→ /proxy
+        // 上游轮询。某条地址是试听片段就换下一条，直到播出整首；只有
+        // 选中的地址才进缓存，试听片段不缓存。
         let selectedAudioUrl = null;
+        let acceptedResolvedUrl = null;
         let lastAudioError = null;
+        let sawTrialClip = false;
 
-        for (const candidateUrl of candidateAudioUrls) {
-            dom.audioPlayer.src = candidateUrl;
-            dom.audioPlayer.load();
+        // 1. 内存缓存（命中时同样验时长：缓存里可能是旧逻辑存下的片段）。
+        if (!isRetry && audioUrlMemoryCache.has(cacheKey)) {
+            const cachedItem = audioUrlMemoryCache.get(cacheKey);
+            if (Date.now() - cachedItem.timestamp < AUDIO_URL_CACHE_TTL && cachedItem.url) {
+                log(`[音频缓存] 命中内存直链: ${song.name} (${quality}k)，省去 1 次网络请求`);
+                const tried = await tryLoadCandidate(cachedItem.url);
+                if (tried.superseded) return;
+                if (tried.selectedUrl) {
+                    selectedAudioUrl = tried.selectedUrl;
+                    acceptedResolvedUrl = cachedItem.url;
+                } else {
+                    audioUrlMemoryCache.delete(cacheKey);
+                    if (tried.clip) sawTrialClip = true;
+                    else lastAudioError = tried.error;
+                }
+            } else {
+                audioUrlMemoryCache.delete(cacheKey);
+            }
+        }
 
-            try {
-                await waitForAudioReady(dom.audioPlayer);
-                selectedAudioUrl = candidateUrl;
-                break;
-            } catch (error) {
-                lastAudioError = error;
+        // 2. 洛雪脚本：逐条解析、逐条验时长。
+        if (!selectedAudioUrl) {
+            for (const entry of getEnabledLxScriptEntries()) {
+                if (myToken !== currentPlaybackToken) return;
+                let customUrl = null;
+                try {
+                    customUrl = await resolveMusicUrlFromEntry(entry, song, quality);
+                } catch (err) {
+                    console.warn("自定义音源解析异常，尝试下一条:", err);
+                }
+                if (!customUrl) continue;
+                log(`[音频解析] 自定义音源解析成功: ${song.name}`);
+                const tried = await tryLoadCandidate(customUrl);
+                if (tried.superseded) return;
+                if (tried.selectedUrl) {
+                    selectedAudioUrl = tried.selectedUrl;
+                    acceptedResolvedUrl = customUrl;
+                    break;
+                }
+                if (tried.clip) sawTrialClip = true;
+                else lastAudioError = tried.error;
+            }
+        }
+
+        // 3. 默认 /proxy 轮询：按“当前上游 → 其他已启用 api → 默认上游”
+        // 逐个试，拿到地址后同样验时长。
+        if (!selectedAudioUrl) {
+            if (isRetry) {
+                log(`[音频重试] 正在通过非缓存链路重试请求...`);
+            }
+            for (const base of getApiFallbackBases()) {
+                if (myToken !== currentPlaybackToken) return;
+                let audioUrl = API.getSongUrlWithBase(song, quality, base);
+                if (isRetry) {
+                    audioUrl += '&nocache=true';
+                }
+                log(`[音频解析] 请求接口: ${audioUrl}`);
+                let data = null;
+                try {
+                    data = await API.fetchJson(audioUrl);
+                } catch (err) {
+                    console.warn(`[轮询] 上游 ${base || "默认上游"} 取播放地址失败，尝试下一个音源:`, err);
+                    continue;
+                }
+                if (!data || !data.url) continue;
+                const tried = await tryLoadCandidate(data.url);
+                if (tried.superseded) return;
+                if (tried.selectedUrl) {
+                    selectedAudioUrl = tried.selectedUrl;
+                    acceptedResolvedUrl = data.url;
+                    break;
+                }
+                if (tried.clip) sawTrialClip = true;
+                else lastAudioError = tried.error;
             }
         }
 
@@ -411,7 +576,40 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
         }
 
         if (!selectedAudioUrl) {
-            throw lastAudioError || new Error('音频加载失败');
+            const clipError = new Error('只找到试听片段，未找到完整歌曲');
+            clipError.noRetry = true;
+            clipError.reason = 'trial-clip';
+            if (sawTrialClip && !options.noCrossFallback) {
+                // 跨平台代播：原平台只有试听片段时，用网易云/酷我的同名
+                // 完整版顶上（歌名与歌手须同时对上，避免顶错成翻唱版）。
+                const substitute = await findFullVersionSubstitute(song, expectedDuration, log);
+                if (substitute) {
+                    const fromLabel = PLATFORM_SHORT_LABELS[song.source || "netease"] || "";
+                    const toLabel = PLATFORM_SHORT_LABELS[substitute.song.source || "netease"] || "";
+                    showNotification(`《${song.name}》${fromLabel}只有试听片段，已改播${toLabel}完整版`, "info", dom);
+                    try {
+                        return await playSong(
+                            substitute.song,
+                            { ...options, noCrossFallback: true, fallbackExpectedDuration: expectedDuration },
+                            state, dom, callbacks, debugLogger,
+                        );
+                    } catch (subError) {
+                        // 代播也失败：按原歌曲的片段结论处理，不再重试原链路。
+                        throw clipError;
+                    }
+                }
+            }
+            if (sawTrialClip) {
+                // 所有音源都只给了试听片段：重试也拿不到整首，直接跳过
+                // 重试、走自动跳歌，避免反复等同一批超时。
+                throw clipError;
+            }
+            throw lastAudioError || new Error('无法获取音频播放地址');
+        }
+
+        if (acceptedResolvedUrl) {
+            audioUrlMemoryCache.set(cacheKey, { url: acceptedResolvedUrl, timestamp: Date.now() });
+            log(`[音频地址] 解析就绪: ${acceptedResolvedUrl.slice(0, 50)}...`);
         }
 
         if (myToken !== currentPlaybackToken) {
@@ -464,8 +662,42 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
         }
     } catch (error) {
         console.error('播放歌曲失败:', error);
-        if (!isRetry) {
+        // 已被更新的播放请求取代：静默返回，不重试、不跳歌、不报错，
+        // 避免旧请求的重试把用户刚点的歌顶掉、或弹出过时的失败提示。
+        if (myToken !== currentPlaybackToken) return;
+        // noRetry（如所有音源都只给试听片段）是确定性结论，重试也拿不到
+        // 整首：跳过重试，直接清理并走自动跳歌。
+        if (!isRetry && !(error && error.noRetry)) {
             return playSong(song, { ...options, isRetry: true }, state, dom, callbacks, debugLogger);
+        }
+        // 最终失败：清掉音频源，避免残留上一首的地址被播放键误播。
+        if (dom.audioPlayer) {
+            try {
+                dom.audioPlayer.pause();
+                dom.audioPlayer.removeAttribute("src");
+                dom.audioPlayer.src = "";
+                dom.audioPlayer.load();
+            } catch (e) {
+                console.warn("清理失败音频源异常:", e);
+            }
+        }
+        // 复位进度显示：被拒的试听片段加载过元数据，时长栏会残留它的
+        // 短时长，不复位就会显示“00:00 / 00:24”这种误导数字。
+        if (dom.progressBar) {
+            dom.progressBar.value = 0;
+            dom.progressBar.max = 0;
+            updateProgressBarBackground(dom, 0, 1);
+        }
+        if (dom.currentTimeDisplay) dom.currentTimeDisplay.textContent = "00:00";
+        if (dom.durationDisplay) dom.durationDisplay.textContent = "00:00";
+        state.isPlaying = false;
+        updatePlayPauseButton(dom);
+        // 播不了就跳下一首（回调接管后不再抛错，避免再弹通用失败提示；
+        // 没有回调时保持原有抛错行为）。reason 说明失败原因（如试听片段），
+        // 供跳歌提示如实说明。
+        if (typeof callbacks.onPlaybackFailed === "function") {
+            const handled = callbacks.onPlaybackFailed(song, options.autoSkipChain, error && error.reason);
+            if (handled) return;
         }
         throw error;
     } finally {

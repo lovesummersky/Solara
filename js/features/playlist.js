@@ -210,6 +210,65 @@ export function updatePlaylistHighlight(state, dom) {
     });
 }
 
+const PLAYLIST_SOURCE_SHORT = {
+    netease: "网易",
+    tencent: "QQ",
+    kugou: "酷狗",
+    kuwo: "酷我",
+    migu: "咪咕",
+    joox: "JOOX",
+    bilibili: "B站",
+};
+
+const PLAYLIST_COVER_GRADIENTS = [
+    "linear-gradient(135deg, #f43f5e, #f97316)",
+    "linear-gradient(135deg, #8b5cf6, #ec4899)",
+    "linear-gradient(135deg, #0ea5e9, #6366f1)",
+    "linear-gradient(135deg, #14b8a6, #84cc16)",
+];
+
+function playlistCoverUrl(song) {
+    if (!song || typeof song !== "object") return "";
+    for (const key of ["pic", "picUrl", "cover", "pic_id"]) {
+        const value = song[key];
+        if (typeof value === "string" && /^(https?:)?\/\//.test(value)) {
+            return preferHttpsUrl(value);
+        }
+    }
+    return "";
+}
+
+function playlistDurationText(song) {
+    const seconds = Number(song?.duration);
+    if (Number.isFinite(seconds) && seconds > 0) {
+        return formatPlaylistDuration(seconds);
+    }
+    const dt = Number(song?.dt);
+    if (Number.isFinite(dt) && dt > 0) {
+        return formatPlaylistDuration(Math.round(dt / 1000));
+    }
+    return "";
+}
+
+function formatPlaylistDuration(totalSeconds) {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = Math.floor(totalSeconds % 60);
+    return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function playlistCoverHtml(song) {
+    const firstChar = (song?.name || "?").slice(0, 1);
+    const url = playlistCoverUrl(song);
+    if (url) {
+        return `<span class="playlist-item-cover"><img src="${url}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.parentElement.classList.add('is-fallback');this.remove()"><span class="playlist-item-cover-mark" aria-hidden="true">${firstChar}</span></span>`;
+    }
+    const seed = `${song?.source || ""}:${song?.id || ""}:${song?.name || ""}`;
+    let hash = 0;
+    for (let i = 0; i < seed.length; i += 1) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+    const gradient = PLAYLIST_COVER_GRADIENTS[hash % PLAYLIST_COVER_GRADIENTS.length];
+    return `<span class="playlist-item-cover is-fallback" style="background:${gradient}"><span class="playlist-item-cover-mark" aria-hidden="true">${firstChar}</span></span>`;
+}
+
 export function renderPlaylist(state, dom, callbacks = {}) {
     if (!dom.playlistItems) return;
 
@@ -230,15 +289,27 @@ export function renderPlaylist(state, dom, callbacks = {}) {
             ? song.artist.join(", ")
             : (song.artist || "未知艺术家");
         const songKey = getSongKey(song) || `playlist-${index}`;
+        const albumValue = typeof song.album === "string" ? song.album : (song.album?.name || "");
+        const headPart = [PLAYLIST_SOURCE_SHORT[song.source], artistValue].filter(Boolean).join(" ");
+        const metaParts = [];
+        if (headPart) metaParts.push(headPart);
+        if (albumValue) metaParts.push(albumValue);
+        const durationText = playlistDurationText(song);
+        if (durationText) metaParts.push(durationText);
         return `
         <div class="playlist-item" data-index="${index}" role="button" tabindex="0" aria-label="播放 ${song.name}" data-favorite-key="${songKey}">
+            <span class="playlist-item-index">${index + 1}</span>
+            ${playlistCoverHtml(song)}
             <div class="playlist-item-info">
                 <span class="playlist-item-title">${song.name}</span>
-                <span class="playlist-item-artist"> - ${artistValue}</span>
+                <span class="playlist-item-meta">${metaParts.join(" · ")}</span>
             </div>
             <div class="playlist-item-actions" role="toolbar" aria-label="歌曲操作">
                 <button class="playlist-item-favorite favorite-toggle" type="button" data-playlist-action="favorite" data-index="${index}" data-favorite-key="${songKey}" title="收藏" aria-label="收藏">
                     <i class="fa-regular fa-heart"></i>
+                </button>
+                <button class="playlist-item-play" type="button" data-playlist-action="play" data-index="${index}" title="播放" aria-label="播放">
+                    <i class="fas fa-play"></i>
                 </button>
                 <button class="playlist-item-download" type="button" data-playlist-action="download" data-index="${index}" title="下载" aria-label="下载">
                     <i class="fas fa-download"></i>

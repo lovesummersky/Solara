@@ -20,3 +20,6 @@
 
 /* 6. 系统通知微胶囊与设置弹窗适配 */
 @import url("mobile/modals.css");
+
+/* 7. 新界面壳子移动端适配 */
+@import url("mobile/shell.css");

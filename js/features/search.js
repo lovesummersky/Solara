@@ -35,6 +35,10 @@ export function showSearchResults(state, dom) {
     dom.searchResults.classList.add("show");
     dom.searchResults.removeAttribute("hidden");
     dom.searchResults.setAttribute("aria-hidden", "false");
+    // 新界面壳子：搜索结果展示即切到搜索视图（路由不存在时静默跳过，老逻辑不受影响）。
+    if (typeof window !== "undefined" && window.SolaraViews) {
+        window.SolaraViews.show("search");
+    }
 }
 
 export function hideSearchResults(state, dom) {
@@ -42,6 +46,11 @@ export function hideSearchResults(state, dom) {
     dom.searchResults.classList.remove("show");
     dom.searchResults.setAttribute("hidden", "");
     dom.searchResults.setAttribute("aria-hidden", "true");
+    // 新界面壳子：收起搜索后回到正在播放视图（仅当当前正停在搜索视图时才动，
+    // 避免侧栏导航等点击冒泡到 document 时把新视图顶回去）。
+    if (typeof window !== "undefined" && window.SolaraViews) {
+        window.SolaraViews.onSearchHidden();
+    }
 }
 
 export function restoreLastSearchResults(state, dom, callbacks = {}, options = {}) {

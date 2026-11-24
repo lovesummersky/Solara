@@ -21,7 +21,9 @@ export const EXPLORE_RADAR_GENRES = [
 export const SOURCE_OPTIONS = [
     { value: "netease", label: "网易云音乐" },
     { value: "tencent", label: "QQ音乐" },
+    { value: "kugou", label: "酷狗音乐" },
     { value: "kuwo", label: "酷我音乐" },
+    { value: "migu", label: "咪咕音乐" },
     { value: "joox", label: "JOOX音乐" },
     { value: "bilibili", label: "哔哩哔哩" }
 ];
@@ -186,6 +188,36 @@ export function sanitizeCustomApiEntry(raw) {
 
 export const DEFAULT_LX_SCRIPT_SOURCES = [
     {
+        id: "default-hei",
+        name: "Hei Music聚合源",
+        url: "https://lxmusic.1381886.xyz/sources/d0947a4fe4.js",
+    },
+    {
+        id: "default-wending",
+        name: "稳定版音源 v1.0.3",
+        url: "https://lxmusic.1381886.xyz/sources/09382b4b05.js",
+    },
+    {
+        id: "default-shouji",
+        name: "收集の聚合接口(LX版)",
+        url: "https://lxmusic.1381886.xyz/sources/e4927e850e.js",
+    },
+    {
+        id: "default-xigua",
+        name: "西瓜聚合源",
+        url: "https://lxmusic.1381886.xyz/sources/2f0663b30a.js",
+    },
+    {
+        id: "default-xinghai-pdone",
+        name: "星海音乐源 (pdone)",
+        url: "https://raw.githubusercontent.com/pdone/lx-music-source/main/xinghai/latest.js",
+    },
+    {
+        id: "default-yuningxi",
+        name: "lx-玉宁熙-Pro",
+        url: "https://lxmusic.1381886.xyz/sources/e4baddc775.js",
+    },
+    {
         id: "default-doubao",
         name: "豆包定制",
         url: "https://lxmusic.1381886.xyz/sources/f600412fe0.js",
@@ -195,13 +227,52 @@ export const DEFAULT_LX_SCRIPT_SOURCES = [
         name: "星海音乐源",
         url: "https://lxmusic.1381886.xyz/sources/remote/xinghai.js",
     },
+    {
+        id: "default-huibi",
+        name: "回避聚合 (HuiBi Aggregate)",
+        url: "https://lxmusic.1381886.xyz/sources/2e8e5efc47.js",
+    },
+    {
+        id: "default-kulao",
+        name: "👖裤佬SVIP音源(二改整合版)",
+        url: "https://lxmusic.1381886.xyz/sources/db1633ebdc.js",
+    },
+    {
+        id: "default-molan",
+        name: "墨澜聚合音源",
+        url: "https://lxmusic.1381886.xyz/sources/3c9c4b293e.js",
+    },
+    {
+        id: "default-xinghai-3217",
+        name: "星海音乐源 v3.2.17",
+        url: "https://lxmusic.1381886.xyz/sources/0b3492d150.js",
+    },
+    {
+        id: "default-hyw",
+        name: "HYWmusic_公益版",
+        url: "https://lxmusic.1381886.xyz/sources/5c5f30d31c.js",
+    },
+    {
+        id: "default-xinglan",
+        name: "星澜聚合音源 (StellarWave)",
+        url: "https://lxmusic.1381886.xyz/sources/56d2f39627.js",
+    },
+    {
+        id: "default-fish",
+        name: "fish_music",
+        url: "https://lxmusic.1381886.xyz/sources/648d5f515a.js",
+    },
 ];
 
 /**
- * 默认音源补齐标记：只在每个浏览器里执行一次。补齐后用户删掉某条脚本
- * 就是用户自己的选择，不会再被重加回来。
+ * 默认音源补齐标记：只在每个浏览器里执行一次（v4：6 条实测满版排前面、
+ * 移除 1010、补 7 条新音源）。
+ * 补齐时默认音源按 DEFAULT_LX_SCRIPT_SOURCES 的顺序排在前面，已有条目
+ * 保留原样（包括用户手动禁用的状态），用户自己后加的条目排在后面。
+ * 补齐后用户删掉某条脚本就是用户自己的选择，不会再被重加回来
+ * （除非标记版本再次升级）。
  */
-export const DEFAULT_SOURCES_SEEDED_STORAGE_KEY = "solara.defaultSourcesSeeded.v1";
+export const DEFAULT_SOURCES_SEEDED_STORAGE_KEY = "solara.defaultSourcesSeeded.v4";
 
 let defaultSourcesSeedAttempted = false;
 
@@ -214,17 +285,27 @@ function ensureDefaultCustomSources() {
         const raw = localStorage.getItem(CUSTOM_APIS_STORAGE_KEY);
         const parsed = raw ? JSON.parse(raw) : [];
         const existing = Array.isArray(parsed) ? parsed.map(sanitizeCustomApiEntry).filter(Boolean) : [];
-        const existingUrls = new Set(existing.map((e) => e.url));
-        const missing = DEFAULT_LX_SCRIPT_SOURCES.filter((d) => !existingUrls.has(d.url));
-        if (missing.length > 0) {
-            const seeded = missing.map((d) => sanitizeCustomApiEntry({
+        const defaultUrls = new Set(DEFAULT_LX_SCRIPT_SOURCES.map((d) => d.url));
+        const orderedDefaults = DEFAULT_LX_SCRIPT_SOURCES.map((d) => {
+            const found = existing.find((e) => e.url === d.url);
+            if (found) return found;
+            return sanitizeCustomApiEntry({
                 id: d.id,
                 name: d.name,
                 url: d.url,
                 kind: "lx-script",
                 enabled: true,
-            })).filter(Boolean);
-            localStorage.setItem(CUSTOM_APIS_STORAGE_KEY, JSON.stringify([...existing, ...seeded]));
+            });
+        }).filter(Boolean);
+        // v4 起不再默认带 1010：删掉当初种下的那条（id 为 default-1010），
+        // 用户自己手动加的 1010（id 不同）不受影响。
+        const userEntries = existing.filter((e) => !defaultUrls.has(e.url) && e.id !== "default-1010");
+        const missing = DEFAULT_LX_SCRIPT_SOURCES.filter((d) => !existing.some((e) => e.url === d.url));
+        if (missing.length > 0) {
+            localStorage.setItem(CUSTOM_APIS_STORAGE_KEY, JSON.stringify([...orderedDefaults, ...userEntries]));
+        } else if (existing.length > 0 && JSON.stringify(existing) !== JSON.stringify([...orderedDefaults, ...userEntries])) {
+            // 缺的都已在：只把顺序理成默认顺序，不增删条目。
+            localStorage.setItem(CUSTOM_APIS_STORAGE_KEY, JSON.stringify([...orderedDefaults, ...userEntries]));
         }
         localStorage.setItem(DEFAULT_SOURCES_SEEDED_STORAGE_KEY, "1");
     } catch {
@@ -327,8 +408,9 @@ export function hasPassingApiEntry(entries) {
  * 主界面音源下拉的可见选项：没测过的平台照常显示；检测出“没有音源”（失败或
  * 无结果）的平台不显示——除非某条已启用的洛雪脚本逐平台检测通过了它（脚本能
  * 解析该平台的播放地址），这时也显示。两者取并集：只要有一处通过就显示。
- * 脚本平台与下拉选项的对应只有 wy/tx/kw 三个（下拉没有酷狗/咪咕/汽水选项）。
+ * 脚本平台与下拉选项的对应只有 wy/tx/kg/kw/mg（网易云/QQ/酷狗/酷我/咪咕）。
  * 如果全部平台都没通过则全部显示，避免下拉变空。
+ * 注意：顶部平台切换下拉不走这里，它始终显示全部 7 个平台。
  */
 export function getVisibleSourceOptions() {
     const results = loadHealthCheckResults();
@@ -423,6 +505,9 @@ async function searchOnce(keyword, source, count, page, base, debugLogger) {
         name: song.name,
         artist: song.artist,
         album: song.album,
+        // duration/dt 必须保留：播放器靠全长判断解析出的地址是不是试听片段。
+        duration: song.duration,
+        dt: song.dt,
         pic_id: song.pic_id,
         url_id: song.url_id,
         lyric_id: song.lyric_id,
@@ -455,6 +540,8 @@ async function fetchRadarOnce(playlistId, limit, offset, base) {
             album: track.al?.name || "",
             source: "netease",
             lyric_id: track.id,
+            // dt（毫秒）必须保留：播放器靠全长判断解析出的地址是不是试听片段。
+            dt: track.dt,
             pic: directPicUrl,
             pic_id: track.al?.pic_str || track.al?.pic || "",
             url_id: track.id,
@@ -649,6 +736,12 @@ export const API = {
     getPicUrl: (song) => {
         const signature = API.generateSignature();
         return withActiveApiBase(`${API.baseUrl}?types=pic&id=${song.pic_id}&source=${song.source || "netease"}&size=300&s=${signature}`);
+    },
+
+    /** 外部歌单导入：服务端直取官方歌单接口（QQ / 酷狗 / 酷我），不走 GD 上游。 */
+    importPlaylist: async (platform, playlistId) => {
+        const url = `${API.baseUrl}?types=import&platform=${encodeURIComponent(platform)}&id=${encodeURIComponent(playlistId)}`;
+        return API.fetchJson(url);
     }
 };
 

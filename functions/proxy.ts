@@ -37,6 +37,9 @@ function normalizeTencentItem(item: any): any | null {
     name: String(name),
     artist: tencentArtistName(item) || "未知艺术家",
     album: album?.name || item.albumname || (typeof item.album === "string" ? item.album : ""),
+    // interval 为歌曲全长（秒）：播放器用它判断解析出的地址是不是试听片段，
+    // 缺了它就无法识别，宁可为 0（跳过判断）也不填错值。
+    duration: Number(item.interval) || 0,
     pic_id: album?.mid || item.albummid || "",
     url_id: String(mid),
     lyric_id: String(mid),
@@ -291,6 +294,8 @@ function normalizeKugouItem(raw: any): any | null {
     name,
     artist,
     album: decodeKuwoName(raw.AlbumName || ""),
+    // Duration 为歌曲全长（秒）：播放器用它判断解析出的地址是不是试听片段。
+    duration: Number(raw.Duration) || 0,
     pic_id: raw.AlbumID != null ? String(raw.AlbumID) : "",
     url_id: String(hash),
     lyric_id: String(hash),
@@ -725,6 +730,520 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   return response;
 }
 
+/* ============ 榜单与发现（服务端直取官方接口，1 天缓存） ============ */
+
+/**
+ * 榜单只接已实测的官方接口，名字与编号逐一核对过：
+ * QQ（c.y.qq.com toplist，topid 28 已核对为网络歌曲榜；29/72 名字未核实，不收录；
+ * TVB/KKBOX 无此接口，不收录）；网易云（官方歌单 id）；酷我（kbangserver）。
+ * 酷狗榜单接口实测未返回数据、咪咕/JOOX/B站无已验证接口，这些平台返回
+ * unsupported，由界面如实显示“暂未接入”，绝不编造榜单数据。
+ * 趋势百分比/箭头：上述接口不返回可靠的排名变化字段，v1 只给名次与
+ * 时长，不编趋势数据；MV/VIP 角标只按接口明确字段映射。
+ */
+const CHART_TTL_SECONDS = 86400;
+
+const QQ_CHARTS: Record<string, { topid: number; name: string }> = {
+  hot: { topid: 26, name: "热歌榜" },
+  new: { topid: 27, name: "新歌榜" },
+  soaring: { topid: 62, name: "飙升榜" },
+  pop: { topid: 4, name: "流行指数榜" },
+  mainland: { topid: 5, name: "内地榜" },
+  western: { topid: 3, name: "欧美榜" },
+  korea: { topid: 16, name: "韩国榜" },
+  japan: { topid: 17, name: "日本榜" },
+  hk: { topid: 59, name: "香港地区榜" },
+  tw: { topid: 61, name: "台湾地区榜" },
+  network: { topid: 28, name: "网络歌曲榜" },
+};
+
+const NETEASE_CHARTS: Record<string, { id: string; name: string }> = {
+  hot: { id: "3778678", name: "热歌榜" },
+  soaring: { id: "19723756", name: "飙升榜" },
+  new: { id: "3779629", name: "新歌榜" },
+  original: { id: "2884035", name: "原创榜" },
+};
+
+const KUWO_CHARTS: Record<string, { id: string; name: string }> = {
+  hot: { id: "16", name: "酷我热歌榜" },
+};
+
+function beijingDateString(): string {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+function clampChartInt(value: number, fallback: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
+async function fetchQQToplist(topid: number, offset: number, limit: number): Promise<{ date: string; total: number; songs: any[] }> {
+  const songs: any[] = [];
+  let total = 0;
+  let date = "";
+  // QQ 单次最多回 50 条，超了就按 song_begin 分页拉，最多 6 页（300 首）。
+  let begin = offset;
+  let pages = 0;
+  while (songs.length < limit && pages < 6) {
+    const want = Math.min(50, offset + limit - begin);
+    if (want <= 0) break;
+    const params = new URLSearchParams({
+      tpl: "3", page: "detail", topid: String(topid), type: "top",
+      song_begin: String(begin), song_num: String(want),
+      format: "json", inCharset: "utf8", outCharset: "utf-8", notice: "0",
+      platform: "yqq.json", needNewCode: "0",
+    });
+    const response = await fetchWithTimeout(`https://c.y.qq.com/v8/fcg-bin/fcg_v8_toplist_cp.fcg?${params.toString()}`, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Referer: "https://y.qq.com/",
+      },
+    }, 10000);
+    if (!response.ok) throw new Error(`QQ 榜单返回 HTTP ${response.status}`);
+    const json: any = await response.json();
+    if (!json || json.code !== 0) throw new Error(`QQ 榜单返回异常 code=${json?.code}`);
+    total = Number(json.total_song_num) || total;
+    date = String(json.date || date);
+    const list = Array.isArray(json.songlist) ? json.songlist : [];
+    if (list.length === 0) break;
+    list.forEach((entry: any, i: number) => {
+      const d = entry?.data;
+      if (!d?.songmid || !d?.songname) return;
+      const singers = Array.isArray(d.singer) ? d.singer.map((s: any) => s?.name).filter(Boolean).join(" / ") : "";
+      const albummid = String(d.albummid || "");
+      songs.push({
+        rank: begin + i + 1,
+        id: String(d.songmid),
+        name: String(d.songname),
+        artist: singers || "未知艺术家",
+        album: String(d.albumname || ""),
+        duration: Number(d.interval) || 0,
+        pic_id: albummid,
+        url_id: String(d.songmid),
+        lyric_id: String(d.songmid),
+        source: "tencent",
+        pic: albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${albummid}.jpg` : "",
+        mv: Boolean(d.vid),
+        vip: d?.pay?.payplay === 1,
+      });
+    });
+    pages += 1;
+    begin += list.length;
+    if (list.length < want) break;
+    if (total > 0 && begin >= total) break;
+  }
+  return { date: date || beijingDateString(), total, songs };
+}
+
+async function fetchNeteaseChart(id: string, offset: number, limit: number): Promise<{ date: string; total: number; songs: any[] }> {
+  const response = await fetchWithTimeout(`https://music.163.com/api/playlist/detail?id=${encodeURIComponent(id)}`, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    },
+  }, 10000);
+  if (!response.ok) throw new Error(`网易云榜单返回 HTTP ${response.status}`);
+  const json: any = await response.json();
+  const result = json?.result;
+  if (!result || !Array.isArray(result.tracks)) throw new Error("网易云榜单返回结构异常");
+  const tracks = result.tracks;
+  const total = Number(result.trackCount) || tracks.length;
+  const slice = tracks.slice(offset, offset + limit);
+  const songs = slice.map((t: any, i: number) => ({
+    rank: offset + i + 1,
+    id: String(t.id),
+    name: String(t.name || ""),
+    artist: (Array.isArray(t.artists) ? t.artists.map((a: any) => a?.name).filter(Boolean).join(" / ") : "") || "未知艺术家",
+    album: String(t.album?.name || ""),
+    duration: Math.round(Number(t.duration || t.dt || 0) / 1000),
+    pic_id: "",
+    url_id: String(t.id),
+    lyric_id: String(t.id),
+    source: "netease",
+    pic: String(t.album?.picUrl || ""),
+    mv: Number(t.mv) > 0,
+    vip: Number(t.fee) === 1,
+  }));
+  const updateTime = Number(result.updateTime);
+  const date = updateTime ? new Date(updateTime + 8 * 3600 * 1000).toISOString().slice(0, 10) : beijingDateString();
+  return { date, total, songs };
+}
+
+async function fetchKuwoChart(id: string, offset: number, limit: number): Promise<{ date: string; total: number; songs: any[] }> {
+  const songs: any[] = [];
+  let total = 0;
+  let date = "";
+  let begin = offset;
+  let pages = 0;
+  while (songs.length < limit && pages < 6) {
+    const want = Math.min(50, offset + limit - begin);
+    if (want <= 0) break;
+    const params = new URLSearchParams({
+      from: "pc", fmt: "json", pn: String(begin), rn: String(want),
+      type: "bang", data: "content", id,
+    });
+    const response = await fetchWithTimeout(`http://kbangserver.kuwo.cn/ksong.s?${params.toString()}`, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+    }, 10000);
+    if (!response.ok) throw new Error(`酷我榜单返回 HTTP ${response.status}`);
+    const json: any = await response.json();
+    const list = Array.isArray(json?.musiclist) ? json.musiclist : [];
+    if (list.length === 0) break;
+    total = Number(json.num) || total;
+    date = String(json.pub || date);
+    list.forEach((item: any, i: number) => {
+      if (!item?.id || !item?.name) return;
+      songs.push({
+        rank: begin + i + 1,
+        id: String(item.id),
+        name: String(item.name),
+        artist: String(item.artist || "") || "未知艺术家",
+        album: String(item.album || ""),
+        duration: Number(item.song_duration) || Number(item.duration) || 0,
+        pic_id: item.albumid != null ? String(item.albumid) : "",
+        url_id: String(item.id),
+        lyric_id: String(item.id),
+        source: "kuwo",
+        pic: "",
+        mv: false,
+        vip: false,
+        trend: String(item.trend || "").startsWith("u") ? "up" : String(item.trend || "").startsWith("d") ? "down" : "flat",
+        trendChange: Number(item.rank_change) || 0,
+      });
+    });
+    pages += 1;
+    begin += list.length;
+    if (list.length < want) break;
+    if (total > 0 && begin >= total) break;
+  }
+  return { date: date || beijingDateString(), total, songs };
+}
+
+function chartCatalogFor(platform: string): Record<string, { name: string }> | null {
+  if (platform === "tencent") return QQ_CHARTS;
+  if (platform === "netease") return NETEASE_CHARTS;
+  if (platform === "kuwo") return KUWO_CHARTS;
+  return null;
+}
+
+function chartJsonHeaders(cacheable: boolean): Headers {
+  const headers = createCorsHeaders();
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Cache-Control", cacheable
+    ? `public, s-maxage=${CHART_TTL_SECONDS}, stale-while-revalidate=${CHART_TTL_SECONDS}`
+    : "no-store, no-cache, must-revalidate");
+  return headers;
+}
+
+async function handleChart(url: URL, request: Request, waitUntil?: (promise: Promise<any>) => void): Promise<Response> {
+  const platform = (url.searchParams.get("platform") || "tencent").toLowerCase();
+  const chart = (url.searchParams.get("chart") || "hot").toLowerCase();
+  const offset = clampChartInt(Number(url.searchParams.get("offset")), 0, 0, 10000);
+  const limit = clampChartInt(Number(url.searchParams.get("limit")), 50, 1, 300);
+
+  const catalog = chartCatalogFor(platform);
+  if (!catalog) {
+    return new Response(JSON.stringify({
+      platform, chart, name: "", date: beijingDateString(), total: 0, songs: [], unsupported: true,
+    }), { status: 200, headers: chartJsonHeaders(false) });
+  }
+  const def: any = (catalog as Record<string, any>)[chart];
+  if (!def) {
+    return new Response(JSON.stringify({ error: "Unknown chart" }), {
+      status: 400, headers: { "Content-Type": "application/json; charset=utf-8" },
+    });
+  }
+
+  const cache = caches.default;
+  const cacheKey = new Request(url.toString());
+  if (request.method === "GET" && url.searchParams.get("nocache") !== "true") {
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        const hit = new Response(cached.body, cached);
+        hit.headers.set("X-Cache-Status", "HIT");
+        hit.headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
+        return hit;
+      }
+    } catch (err) {
+      console.warn("[榜单缓存] 读缓存失败:", err);
+    }
+  }
+
+  try {
+    let data: { date: string; total: number; songs: any[] };
+    if (platform === "tencent") data = await fetchQQToplist(def.topid, offset, limit);
+    else if (platform === "netease") data = await fetchNeteaseChart(def.id, offset, limit);
+    else data = await fetchKuwoChart(def.id, offset, limit);
+    const payload = { platform, chart, name: def.name, date: data.date, total: data.total, songs: data.songs };
+    const headers = chartJsonHeaders(data.songs.length > 0);
+    headers.set("X-Cache-Status", "MISS");
+    headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
+    const response = new Response(JSON.stringify(payload), { status: 200, headers });
+    if (data.songs.length > 0 && waitUntil) {
+      waitUntil(cache.put(cacheKey, response.clone()));
+    }
+    return response;
+  } catch (err) {
+    console.warn("[榜单] 获取失败:", err);
+    return new Response(JSON.stringify({ error: "榜单获取失败" }), {
+      status: 502, headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+}
+
+async function fetchNeteasePersonalized(limit: number): Promise<any[]> {
+  const response = await fetchWithTimeout(`https://music.163.com/api/personalized/playlist?limit=${limit}`, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    },
+  }, 10000);
+  if (!response.ok) throw new Error(`网易云推荐歌单返回 HTTP ${response.status}`);
+  const json: any = await response.json();
+  if (!json || json.code !== 200 || !Array.isArray(json.result)) throw new Error("网易云推荐歌单返回结构异常");
+  return json.result.map((p: any) => ({
+    id: String(p.id),
+    name: String(p.name || ""),
+    pic: String(p.picUrl || ""),
+    playCount: Number(p.playCount) || 0,
+    trackCount: Number(p.trackCount) || 0,
+  })).filter((p: any) => p.id && p.name);
+}
+
+async function handleDiscover(url: URL, request: Request, waitUntil?: (promise: Promise<any>) => void): Promise<Response> {
+  const platform = (url.searchParams.get("platform") || "tencent").toLowerCase();
+  const cache = caches.default;
+  const cacheKey = new Request(url.toString());
+  if (request.method === "GET" && url.searchParams.get("nocache") !== "true") {
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) {
+        const hit = new Response(cached.body, cached);
+        hit.headers.set("X-Cache-Status", "HIT");
+        hit.headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
+        return hit;
+      }
+    } catch (err) {
+      console.warn("[发现缓存] 读缓存失败:", err);
+    }
+  }
+  try {
+    let sections: any[] = [];
+    let date = beijingDateString();
+    if (platform === "tencent") {
+      const fresh = await fetchQQToplist(27, 0, 9);
+      const hot = await fetchQQToplist(26, 0, 9);
+      date = fresh.date || hot.date || date;
+      sections = [
+        { title: "新歌速递", kind: "songs", items: fresh.songs },
+        { title: "热门单曲", kind: "songs", items: hot.songs },
+      ];
+    } else if (platform === "netease") {
+      const playlists = await fetchNeteasePersonalized(6);
+      const fresh = await fetchNeteaseChart("3779629", 0, 9);
+      date = fresh.date || date;
+      sections = [
+        { title: "推荐歌单", kind: "playlists", items: playlists },
+        { title: "新歌榜", kind: "songs", items: fresh.songs },
+      ];
+    } else if (platform === "kuwo") {
+      const hot = await fetchKuwoChart("16", 0, 9);
+      date = hot.date || date;
+      sections = [{ title: "热歌榜", kind: "songs", items: hot.songs }];
+    } else {
+      return new Response(JSON.stringify({
+        platform, date, sections: [], unsupported: true,
+      }), { status: 200, headers: chartJsonHeaders(false) });
+    }
+    const payload = { platform, date, sections };
+    const headers = chartJsonHeaders(true);
+    headers.set("X-Cache-Status", "MISS");
+    headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
+    const response = new Response(JSON.stringify(payload), { status: 200, headers });
+    if (waitUntil) waitUntil(cache.put(cacheKey, response.clone()));
+    return response;
+  } catch (err) {
+    console.warn("[发现] 获取失败:", err);
+    return new Response(JSON.stringify({ error: "发现内容获取失败" }), {
+      status: 502, headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+}
+
+/* ─── 外部歌单导入：QQ / 酷狗 / 酷我 ────────────────────────────────
+   路线与榜单相同：服务端直取各平台公开的歌单接口（做法参考 winterssy /
+   mxget、yhsj0919/KMusic 等开源项目公开的接口形态），返回 GD 形态的歌曲
+   列表，复用现有播放链路。咪咕 / 哔哩哔哩歌单暂未接入：前者详情页需
+   解析内嵌的非标准 JSON，后者音频歌单接口未验证——不返回假数据。 */
+
+const IMPORT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+function importPicHttps(pic: string): string {
+  return pic ? pic.replace(/^http:\/\//, "https://") : "";
+}
+
+async function fetchQQPlaylist(disstid: string): Promise<{ name: string; total: number; songs: any[] }> {
+  const params = new URLSearchParams({
+    type: "1", json: "1", utf8: "1", onlysong: "0", disstid,
+    format: "json", g_tk: "5381", loginUin: "0", hostUin: "0",
+    inCharset: "utf8", outCharset: "utf-8", notice: "0", platform: "yqq", needNewCode: "0",
+  });
+  const response = await fetchWithTimeout(`https://c.y.qq.com/qzone/fcg-bin/fcg_ucc_getcdinfo_byids_cp.fcg?${params.toString()}`, {
+    headers: { Accept: "application/json", "User-Agent": IMPORT_UA, Referer: "https://y.qq.com/" },
+  }, 15000);
+  if (!response.ok) throw new Error(`QQ 歌单返回 HTTP ${response.status}`);
+  const json: any = await response.json();
+  const cd = Array.isArray(json?.cdlist) ? json.cdlist[0] : null;
+  if (!cd) throw new Error("QQ 歌单无数据");
+  const list = Array.isArray(cd.songlist) ? cd.songlist : [];
+  const songs = list.filter((s: any) => s?.songmid && s?.songname).slice(0, 300).map((s: any, i: number) => {
+    const singers = Array.isArray(s.singer) ? s.singer.map((x: any) => x?.name).filter(Boolean).join(" / ") : "";
+    const albummid = String(s.albummid || "");
+    return {
+      rank: i + 1,
+      id: String(s.songmid),
+      name: String(s.songname),
+      artist: singers || "未知艺术家",
+      album: String(s.albumname || s.albumdesc || ""),
+      duration: Number(s.interval) || 0,
+      pic_id: albummid,
+      url_id: String(s.songmid),
+      lyric_id: String(s.songmid),
+      source: "tencent",
+      pic: albummid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${albummid}.jpg` : "",
+      mv: Boolean(s.vid),
+      vip: s?.pay?.payplay === 1,
+    };
+  });
+  return { name: String(cd.dissname || ""), total: Number(cd.songnum) || songs.length, songs };
+}
+
+async function fetchKugouPlaylist(specialid: string): Promise<{ name: string; total: number; songs: any[] }> {
+  const songs: any[] = [];
+  let page = 1;
+  while (songs.length < 500 && page <= 5) {
+    const params = new URLSearchParams({ specialid, page: String(page), pagesize: "100" });
+    const response = await fetchWithTimeout(`http://mobilecdn.kugou.com/api/v3/special/song?${params.toString()}`, {
+      headers: { Accept: "application/json", "User-Agent": IMPORT_UA },
+    }, 15000);
+    if (!response.ok) throw new Error(`酷狗歌单返回 HTTP ${response.status}`);
+    const json: any = await response.json();
+    if (json?.errcode !== 0) throw new Error(`酷狗歌单返回异常 errcode=${json?.errcode}`);
+    const info = Array.isArray(json?.data?.info) ? json.data.info : [];
+    if (info.length === 0) break;
+    info.forEach((s: any) => {
+      const hash = String(s?.hash || "");
+      if (!hash) return;
+      // 该接口不直接给歌名/歌手字段，从 filename "歌手 - 歌名" 拆分。
+      const filename = String(s.filename || "");
+      const sep = filename.indexOf(" - ");
+      const artist = sep > 0 ? filename.slice(0, sep).trim() : "";
+      const name = sep > 0 ? filename.slice(sep + 3).trim() : filename;
+      if (!name) return;
+      songs.push({
+        rank: songs.length + 1,
+        id: hash,
+        name,
+        artist: artist || "未知艺术家",
+        album: "",
+        duration: Number(s.duration) || 0,
+        pic_id: String(s.album_id || ""),
+        url_id: hash,
+        lyric_id: hash,
+        source: "kugou",
+        pic: "",
+        mv: Boolean(s.mvhash),
+        vip: false,
+      });
+    });
+    if (info.length < 100) break;
+    page += 1;
+  }
+  return { name: "", total: songs.length, songs };
+}
+
+async function fetchKuwoPlaylist(pid: string): Promise<{ name: string; total: number; songs: any[] }> {
+  const songs: any[] = [];
+  const seen = new Set<string>();
+  let total = 0;
+  let pn = 0;
+  while (songs.length < 500 && pn < 5) {
+    const params = new URLSearchParams({
+      op: "getlistinfo", pid, pn: String(pn), rn: "100",
+      encode: "utf8", keyset: "pl2012", vipver: "MUSIC_9.1.1.2_BCS2", newver: "1",
+    });
+    const response = await fetchWithTimeout(`http://nplserver.kuwo.cn/pl.svc?${params.toString()}`, {
+      headers: { Accept: "application/json", "User-Agent": IMPORT_UA },
+    }, 15000);
+    if (!response.ok) throw new Error(`酷我歌单返回 HTTP ${response.status}`);
+    const json: any = await response.json();
+    const list = Array.isArray(json?.musiclist) ? json.musiclist : [];
+    if (pn === 0) total = Number(json?.total) || 0;
+    if (list.length === 0) break;
+    list.forEach((s: any) => {
+      const id = s?.id != null ? String(s.id) : "";
+      if (!id || !s?.name || seen.has(id)) return;
+      seen.add(id);
+      songs.push({
+        rank: songs.length + 1,
+        id,
+        name: String(s.name),
+        artist: String(s.artist || "未知艺术家"),
+        album: String(s.album || ""),
+        duration: Number(s.duration) || 0,
+        pic_id: s?.albumid != null ? String(s.albumid) : "",
+        url_id: id,
+        lyric_id: id,
+        source: "kuwo",
+        pic: importPicHttps(String(s.albumpic || "")),
+        mv: Boolean(s.hasmv),
+        vip: false,
+      });
+    });
+    if (total > 0 && songs.length >= total) break;
+    if (list.length < 100) break;
+    pn += 1;
+  }
+  return { name: "", total: total || songs.length, songs };
+}
+
+async function handleImport(url: URL): Promise<Response> {
+  const platform = (url.searchParams.get("platform") || "").toLowerCase();
+  const id = (url.searchParams.get("id") || "").trim();
+  const bad = (message: string) => new Response(JSON.stringify({ error: message }), {
+    status: 400, headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+  });
+  if (!/^\d+$/.test(id)) return bad("歌单 id 无效");
+  if (platform !== "tencent" && platform !== "kugou" && platform !== "kuwo") {
+    return bad("该平台歌单暂未接入");
+  }
+  try {
+    const data = platform === "tencent"
+      ? await fetchQQPlaylist(id)
+      : platform === "kugou"
+        ? await fetchKugouPlaylist(id)
+        : await fetchKuwoPlaylist(id);
+    if (data.songs.length === 0) {
+      return new Response(JSON.stringify({ error: "歌单没有取到歌曲" }), {
+        status: 502, headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    return new Response(JSON.stringify({ platform, name: data.name, total: data.total, songs: data.songs }), {
+      status: 200, headers: chartJsonHeaders(false),
+    });
+  } catch (err) {
+    console.warn("[导入] 获取失败:", err);
+    return new Response(JSON.stringify({ error: "歌单获取失败" }), {
+      status: 502, headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*" },
+    });
+  }
+}
+
 export async function onRequest({ request, waitUntil, env }: { request: Request, waitUntil: (promise: Promise<any>) => void, env: any }): Promise<Response> {
   // 优先使用环境变量中配置的 API 地址，CF 部署未设置时 fallback 到默认节点；
   // 界面里用户添加并设为“当前生效”的自定义上游（?apiBase=）优先级最高，
@@ -754,6 +1273,19 @@ export async function onRequest({ request, waitUntil, env }: { request: Request,
 
   if (target) {
     return proxyKuwoAudio(target, request);
+  }
+
+  // 榜单与发现走服务端直取官方接口（1 天缓存），不经过 GD 上游。
+  if (url.searchParams.get("types") === "chart") {
+    return handleChart(url, request, waitUntil);
+  }
+  if (url.searchParams.get("types") === "discover") {
+    return handleDiscover(url, request, waitUntil);
+  }
+
+  // 外部歌单导入走服务端直取官方接口，不经过 GD 上游。
+  if (url.searchParams.get("types") === "import") {
+    return handleImport(url);
   }
 
   // QQ 搜索走洛雪式适配器，不经过 GD 上游（GD 对 tencent 返回 400）。

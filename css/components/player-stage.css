@@ -684,6 +684,106 @@ body.dark-mode .playlist-items .playlist-item.current {
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22) !important;
 }
 
+/* ===== 播放列表行：设计稿样式（仅 #playlist，收藏列表保持原样） ===== */
+#playlist .playlist-item {
+    display: grid;
+    grid-template-columns: 22px 44px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    min-height: 58px;
+    margin-bottom: 2px;
+    transform: none;
+}
+
+#playlist .playlist-item:hover {
+    transform: none;
+}
+
+#playlist .playlist-item-index {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary-color);
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+
+#playlist .playlist-item-cover {
+    position: relative;
+    width: 44px;
+    height: 44px;
+    border-radius: 9px;
+    overflow: hidden;
+    background: rgba(128, 128, 128, 0.18);
+    flex: none;
+}
+
+#playlist .playlist-item-cover img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+#playlist .playlist-item-cover-mark {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    color: #ffffff;
+    font-size: 18px;
+    font-weight: 700;
+}
+
+#playlist .playlist-item-cover.is-fallback .playlist-item-cover-mark {
+    display: inline-flex;
+}
+
+#playlist .playlist-item-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    gap: 2px;
+    padding-right: 0;
+}
+
+#playlist .playlist-item-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#playlist .playlist-item-meta {
+    font-size: 12.5px;
+    opacity: 0.72;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+#playlist .playlist-item.current {
+    background-color: rgba(229, 72, 77, 0.1) !important;
+    color: inherit !important;
+    border: 1px solid rgba(229, 72, 77, 0.3) !important;
+    border-left: 3.5px solid var(--primary-color) !important;
+    box-shadow: none !important;
+}
+
+body.dark-mode #playlist .playlist-item.current {
+    background-color: rgba(229, 72, 77, 0.18) !important;
+    color: #ffffff !important;
+    border: 1px solid rgba(229, 72, 77, 0.42) !important;
+    border-left: 3.5px solid var(--primary-color) !important;
+    box-shadow: none !important;
+}
+
+#playlist .playlist-item.current .playlist-item-index {
+    color: var(--primary-color);
+}
+
+#playlist .playlist-item.current .playlist-item-title {
+    font-weight: 600;
+}
+
 /* ===== 播放列表与收藏列表操作按钮：极简现代风格 ===== */
 .playlist-item-actions button,
 .playlist-item-favorite,
