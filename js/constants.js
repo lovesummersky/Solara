@@ -184,7 +184,56 @@ export function sanitizeCustomApiEntry(raw) {
     };
 }
 
+export const DEFAULT_LX_SCRIPT_SOURCES = [
+    {
+        id: "default-doubao",
+        name: "豆包定制",
+        url: "https://lxmusic.1381886.xyz/sources/f600412fe0.js",
+    },
+    {
+        id: "default-xinghai",
+        name: "星海音乐源",
+        url: "https://lxmusic.1381886.xyz/sources/remote/xinghai.js",
+    },
+];
+
+/**
+ * 默认音源补齐标记：只在每个浏览器里执行一次。补齐后用户删掉某条脚本
+ * 就是用户自己的选择，不会再被重加回来。
+ */
+export const DEFAULT_SOURCES_SEEDED_STORAGE_KEY = "solara.defaultSourcesSeeded.v1";
+
+let defaultSourcesSeedAttempted = false;
+
+function ensureDefaultCustomSources() {
+    if (defaultSourcesSeedAttempted) return;
+    defaultSourcesSeedAttempted = true;
+    try {
+        if (typeof localStorage === "undefined") return;
+        if (localStorage.getItem(DEFAULT_SOURCES_SEEDED_STORAGE_KEY)) return;
+        const raw = localStorage.getItem(CUSTOM_APIS_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : [];
+        const existing = Array.isArray(parsed) ? parsed.map(sanitizeCustomApiEntry).filter(Boolean) : [];
+        const existingUrls = new Set(existing.map((e) => e.url));
+        const missing = DEFAULT_LX_SCRIPT_SOURCES.filter((d) => !existingUrls.has(d.url));
+        if (missing.length > 0) {
+            const seeded = missing.map((d) => sanitizeCustomApiEntry({
+                id: d.id,
+                name: d.name,
+                url: d.url,
+                kind: "lx-script",
+                enabled: true,
+            })).filter(Boolean);
+            localStorage.setItem(CUSTOM_APIS_STORAGE_KEY, JSON.stringify([...existing, ...seeded]));
+        }
+        localStorage.setItem(DEFAULT_SOURCES_SEEDED_STORAGE_KEY, "1");
+    } catch {
+        // 存储不可用或已有数据损坏时不阻塞读取：本次返回既有结果即可。
+    }
+}
+
 export function loadCustomApis() {
+    ensureDefaultCustomSources();
     try {
         if (typeof localStorage === "undefined") return [];
         const parsed = JSON.parse(localStorage.getItem(CUSTOM_APIS_STORAGE_KEY) || "[]");
