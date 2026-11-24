@@ -659,6 +659,18 @@
                 <p id="customApiFormStatus" class="custom-api-form-status" role="status"></p>
                 <div id="customApiList" class="custom-api-list"></div>
                 <p class="settings-hint">示例：https://lxmusic.1381886.xyz/sources/f600412fe0.js（洛雪脚本，仅解析播放地址）。恢复默认：把自定义 API 停用或删除即可。</p>
+                <div class="source-health-panel">
+                    <div class="source-health-head">
+                        <h4 class="source-health-title">音源检测</h4>
+                        <button type="button" id="sourceHealthCheckBtn" class="custom-api-btn">开始检测</button>
+                    </div>
+                    <p class="settings-hint">对当前上游的各平台实测搜索：检测歌曲可自定义，默认《海阔天空》；建议用各平台都有的歌。点“开始检测”把全部平台逐个测一遍；切换上游后重新检测。</p>
+                    <div class="source-health-form">
+                        <label class="source-health-label" for="sourceHealthSongInput">检测歌曲</label>
+                        <input id="sourceHealthSongInput" class="custom-api-input source-health-song-input" type="text" value="海阔天空" placeholder="输入各平台都有的歌曲名" autocomplete="off">
+                    </div>
+                    <div id="sourceHealthList" class="source-health-list" aria-live="polite"></div>
+                </div>
             </section>
             <section class="settings-section">
                 <h3>系统与调试</h3>

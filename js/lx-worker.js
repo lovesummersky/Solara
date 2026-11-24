@@ -6,13 +6,20 @@
  * 脚本只上报 `musicUrl` 动作，收到请求后返回一个可播地址字符串。
  * 本 Worker 只提供这套最小 shim，并把脚本的网络请求全部经由同源
  * `/proxy-fetch` 转发（避免 CORS，也避免脚本直接拿到页面凭证）。
- * 直接 fetch 被替换为抛错函数：脚本只能走 shim 请求，不能绕过代理。
+ * 直接 fetch 被替换为抛错函数：脚本只能走 shim 请求，不能绕过代理；
+ * shim 内部转发用的原生 fetch 在文件顶部已捕获，不受此替换影响。
  *
  * 安全边界（必须在界面上如实说明）：Worker 隔离的是 DOM/凭证，不是代码
  * 本身——脚本仍可在 Worker 内执行任意计算并通过它自己的上游请求发包。
  * 只添加信任来源的脚本。
  */
 "use strict";
+
+/* 在替换全局 fetch 之前先捕获原生 fetch：doProxyRequest 必须用它走
+ * /proxy-fetch，脚本自己调 fetch 时才走下面的抛错 stub。之前这里直接
+ * 在 doProxyRequest 里调 fetch()，结果调到的是 stub，全部上游请求都
+ * 以 "direct fetch is disabled" 失败，这是本次修复的 bug。 */
+const nativeFetch = typeof fetch === "function" ? fetch.bind(globalThis) : null;
 
 let requestHandler = null;
 let initedConfig = null;
@@ -59,15 +66,19 @@ function bufferToString(buf, encoding) {
 
 /* ---- lx.request：Node 回调风格 (err, res)，res.body 保持字符串 ---- */
 async function doProxyRequest(url, options) {
+    if (!nativeFetch) {
+        throw new Error("Worker 内没有可用的 fetch，无法转发请求");
+    }
     const opts = options || {};
     const timeoutMs = Math.min(Math.max(Number(opts.timeout) || 8000, 1000), 30000);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const response = await fetch("/proxy-fetch?url=" + encodeURIComponent(String(url)), {
+        const response = await nativeFetch("/proxy-fetch?url=" + encodeURIComponent(String(url)), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
+                url: String(url),
                 method: opts.method || "GET",
                 headers: opts.headers || {},
                 body: opts.body != null ? opts.body : (opts.data != null ? opts.data : null),
@@ -75,9 +86,11 @@ async function doProxyRequest(url, options) {
             }),
             signal: controller.signal,
         });
-        const envelope = await response.json().catch(() => null);
+        const rawText = await response.text().catch(() => "");
+        let envelope = null;
+        try { envelope = JSON.parse(rawText); } catch (_) { /* 非 JSON 时按格式错误处理 */ }
         if (!envelope || typeof envelope.statusCode !== "number") {
-            throw new Error("proxy-fetch 返回格式错误 (HTTP " + response.status + ")");
+            throw new Error("proxy-fetch 返回格式错误 (HTTP " + response.status + "): " + rawText.slice(0, 200));
         }
         return {
             statusCode: envelope.statusCode,

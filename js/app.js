@@ -613,7 +613,7 @@ export async function exploreOnlineMusic() {
 
         debugLog(`[音乐雷达] 从设置榜单 [${selectedGenres.join(" / ")}] 随机抽选【${targetPlaylist.name}】(ID: ${targetPlaylist.id})，正在抓取 Top 20...`);
 
-        const results = await API.getRadarPlaylist(targetPlaylist.id, { limit: 20 });
+        const results = await API.getRadarPlaylistWithFallback(targetPlaylist.id, { limit: 20 });
         if (!Array.isArray(results) || results.length === 0) {
             debugLog(`[音乐雷达] 未能从【${targetPlaylist.name}】获取到数据`);
             showNotification(`探索雷达：未能从【${targetPlaylist.name}】获取到歌曲`, "error", dom);

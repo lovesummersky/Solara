@@ -2,7 +2,7 @@
  * Solara 核心音频引擎与播放管线 (HTML5 Audio, 播放模式, 进度/音量同步, 自动切歌)
  */
 
-import { API } from "../constants.js";
+import { API, getApiFallbackBases } from "../constants.js";
 import { safeSetLocalStorage, preferHttpsUrl, buildAudioProxyUrl } from "./storage.js";
 import { showNotification } from "../features/settings.js";
 import { getSongKey } from "../features/playlist.js";
@@ -319,14 +319,28 @@ export async function playSong(song, options = {}, state, dom, callbacks = {}, d
             }
         }
         if (!originalAudioUrl) {
-            let audioUrl = API.getSongUrl(song, quality);
+            // 播放地址轮询：按“当前上游 → 其他已启用 api → 默认上游”逐个试，
+            // 拿到可播地址即停；全部失败时 audioData 保持 null，走原有抛错流程。
+            let audioData = null;
             if (isRetry) {
-                audioUrl += '&nocache=true';
                 log(`[音频重试] 正在通过非缓存链路重试请求...`);
             }
-            log(`[音频解析] 请求接口: ${audioUrl}`);
-
-            const audioData = await API.fetchJson(audioUrl);
+            for (const base of getApiFallbackBases()) {
+                let audioUrl = API.getSongUrlWithBase(song, quality, base);
+                if (isRetry) {
+                    audioUrl += '&nocache=true';
+                }
+                log(`[音频解析] 请求接口: ${audioUrl}`);
+                try {
+                    const data = await API.fetchJson(audioUrl);
+                    if (data && data.url) {
+                        audioData = data;
+                        break;
+                    }
+                } catch (err) {
+                    console.warn(`[轮询] 上游 ${base || "默认上游"} 取播放地址失败，尝试下一个音源:`, err);
+                }
+            }
             if (myToken !== currentPlaybackToken) {
                 return;
             }
@@ -617,9 +631,18 @@ export async function downloadSong(song, quality = "320", dom = null, options = 
             console.warn("自定义音源下载解析异常，回落默认接口:", err);
         }
         if (!audioDataUrl) {
-            const audioUrl = API.getSongUrl(song, quality);
-            const audioData = await API.fetchJson(audioUrl);
-            audioDataUrl = audioData && audioData.url ? audioData.url : null;
+            for (const base of getApiFallbackBases()) {
+                try {
+                    const audioUrl = API.getSongUrlWithBase(song, quality, base);
+                    const audioData = await API.fetchJson(audioUrl);
+                    if (audioData && audioData.url) {
+                        audioDataUrl = audioData.url;
+                        break;
+                    }
+                } catch (err) {
+                    console.warn(`[轮询] 上游 ${base || "默认上游"} 取下载地址失败，尝试下一个音源:`, err);
+                }
+            }
         }
 
         if (audioDataUrl) {

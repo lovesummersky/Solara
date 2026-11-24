@@ -20,6 +20,7 @@ export const EXPLORE_RADAR_GENRES = [
 
 export const SOURCE_OPTIONS = [
     { value: "netease", label: "网易云音乐" },
+    { value: "tencent", label: "QQ音乐" },
     { value: "kuwo", label: "酷我音乐" },
     { value: "joox", label: "JOOX音乐" },
     { value: "bilibili", label: "哔哩哔哩" }
@@ -99,7 +100,7 @@ export const DEFAULT_API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
 
 /** 洛雪平台代码 -> Solara 搜索 source 的映射（只有这两个平台在 Solara 里存在）。 */
 export const LX_PLATFORM_TO_SOLARA_SOURCE = { wy: "netease", kw: "kuwo" };
-export const SOLARA_SOURCE_TO_LX_PLATFORM = { netease: "wy", kuwo: "kw" };
+export const SOLARA_SOURCE_TO_LX_PLATFORM = { netease: "wy", tencent: "tx", kuwo: "kw" };
 
 function isPrivateIpLiteral(hostname) {
     const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
@@ -160,8 +161,14 @@ export function sanitizeCustomApiEntry(raw) {
         enabled: raw.enabled !== false,
         // 只有 api 类型有“当前生效”一说；lx-script 只要 enabled 就会参与解析。
         active: checked.kind === "api" ? raw.active === true : false,
-        status: ["unknown", "ok", "error"].includes(raw.status) ? raw.status : "unknown",
+        status: ["unknown", "ok", "error", "partial"].includes(raw.status) ? raw.status : "unknown",
         statusMessage: typeof raw.statusMessage === "string" ? raw.statusMessage.slice(0, 200) : "",
+        // 逐平台检测结果（仅洛雪脚本）：[{ platform, name, ok }]，按脚本上报顺序存。
+        platformResults: Array.isArray(raw.platformResults) ? raw.platformResults.filter(r => r && typeof r === "object" && typeof r.platform === "string").slice(0, 8).map(r => ({
+            platform: r.platform.slice(0, 16),
+            name: typeof r.name === "string" && r.name ? r.name.slice(0, 20) : r.platform.slice(0, 16),
+            ok: r.ok === true,
+        })) : [],
         meta: {
             name: typeof meta.name === "string" ? meta.name.slice(0, 120) : "",
             version: typeof meta.version === "string" ? meta.version.slice(0, 60) : "",
@@ -192,8 +199,83 @@ export function getActiveApiBaseUrl() {
     return entry ? entry.url : null;
 }
 
-function withActiveApiBase(url) {
-    const base = getActiveApiBaseUrl();
+/**
+ * 音源检测结果存储：按当前生效上游分桶（上游地址或 "default"），避免换了上游
+ * 还沿用旧上游的检测结论。只存每个平台最近一次的状态（ok / empty / error）。
+ */
+export const HEALTH_CHECK_RESULTS_STORAGE_KEY = "solara.healthCheckResults.v1";
+
+function healthCheckResultsKey() {
+    return getActiveApiBaseUrl() || "default";
+}
+
+function readHealthCheckResultsStore() {
+    try {
+        if (typeof localStorage === "undefined") return {};
+        const parsed = JSON.parse(localStorage.getItem(HEALTH_CHECK_RESULTS_STORAGE_KEY) || "{}");
+        return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+        return {};
+    }
+}
+
+/** 当前上游下各平台最近一次检测状态：{ [source]: "ok" | "empty" | "error" }，无记录为空对象。 */
+export function loadHealthCheckResults() {
+    const bucket = readHealthCheckResultsStore()[healthCheckResultsKey()];
+    if (!bucket || typeof bucket !== "object") return {};
+    const out = {};
+    for (const option of SOURCE_OPTIONS) {
+        const record = bucket[option.value];
+        if (record && (record.state === "ok" || record.state === "empty" || record.state === "error")) {
+            out[option.value] = record.state;
+        }
+    }
+    return out;
+}
+
+export function saveHealthCheckResult(source, state) {
+    if (state !== "ok" && state !== "empty" && state !== "error") return;
+    try {
+        if (typeof localStorage === "undefined") return;
+        const store = readHealthCheckResultsStore();
+        const key = healthCheckResultsKey();
+        const bucket = store[key] && typeof store[key] === "object" ? store[key] : {};
+        bucket[source] = { state, at: Date.now() };
+        store[key] = bucket;
+        localStorage.setItem(HEALTH_CHECK_RESULTS_STORAGE_KEY, JSON.stringify(store));
+    } catch {
+        // 存储不可用时检测结果仅保留在本次会话，不影响检测本身。
+    }
+}
+
+/**
+ * 主界面音源下拉的可见选项：没测过的平台照常显示；检测出“没有音源”（失败或
+ * 无结果）的平台不显示——除非某条已启用的洛雪脚本逐平台检测通过了它（脚本能
+ * 解析该平台的播放地址），这时也显示。两者取并集：只要有一处通过就显示。
+ * 脚本平台与下拉选项的对应只有 wy/tx/kw 三个（下拉没有酷狗/咪咕/汽水选项）。
+ * 如果全部平台都没通过则全部显示，避免下拉变空。
+ */
+export function getVisibleSourceOptions() {
+    const results = loadHealthCheckResults();
+    const lxToDropdown = { wy: "netease", tx: "tencent", kw: "kuwo" };
+    const scriptPassing = new Set();
+    for (const entry of loadCustomApis()) {
+        if (entry.kind !== "lx-script" || !entry.enabled || !Array.isArray(entry.platformResults)) continue;
+        for (const record of entry.platformResults) {
+            if (record && record.ok === true && lxToDropdown[record.platform]) {
+                scriptPassing.add(lxToDropdown[record.platform]);
+            }
+        }
+    }
+    const visible = SOURCE_OPTIONS.filter((option) => {
+        const state = results[option.value];
+        if (state !== "error" && state !== "empty") return true;
+        return scriptPassing.has(option.value);
+    });
+    return visible.length > 0 ? visible : SOURCE_OPTIONS.slice();
+}
+
+function withApiBase(url, base) {
     if (!base) return url;
     try {
         const parsed = new URL(url, typeof window !== "undefined" ? window.location.origin : "http://localhost");
@@ -203,6 +285,115 @@ function withActiveApiBase(url) {
     } catch {
         return url;
     }
+}
+
+function withActiveApiBase(url) {
+    return withApiBase(url, getActiveApiBaseUrl());
+}
+
+function describeApiBase(base) {
+    return base || "默认上游";
+}
+
+/**
+ * 音源轮询顺序：当前生效上游在前，其余已启用的自定义 api 按列表顺序
+ * 在后，最后是默认上游（null）。去重；没有任何自定义 api 时只有 [null]，
+ * 与原来“只用默认上游”完全一致。lx-script 不走 api 协议，不参与。
+ */
+export function getApiFallbackBases() {
+    const entries = loadCustomApis().filter(e => e.kind === "api" && e.enabled);
+    const active = entries.find(e => e.active);
+    const ordered = [];
+    const push = (base) => { if (!ordered.includes(base)) ordered.push(base); };
+    if (active) push(active.url);
+    for (const entry of entries) push(entry.url);
+    push(null);
+    return ordered;
+}
+
+/** 单次上游请求的最长等待（轮询时每个上游单独计时，避免一个挂起的上游拖住整条链）。 */
+export const FALLBACK_ATTEMPT_TIMEOUT_MS = 10000;
+
+async function fetchJsonWithTimeout(url, timeoutMs = FALLBACK_ATTEMPT_TIMEOUT_MS, debugLogger = null) {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+        const response = await fetch(url, {
+            headers: { Accept: "application/json" },
+            signal: controller ? controller.signal : undefined,
+        });
+        if (!response.ok) {
+            throw new Error(`Request failed with status ${response.status}`);
+        }
+        const cacheStatus = response.headers.get("X-Cache-Status");
+        if (cacheStatus && typeof debugLogger === "function" && typeof window !== "undefined") {
+            const urlObj = new URL(url, window.location.origin);
+            const type = urlObj.searchParams.get("types") || "未知接口";
+            if (cacheStatus === "HIT") debugLogger(`[边缘缓存] 命中接口数据: ${type}`);
+            else if (cacheStatus === "MISS") debugLogger(`[穿透回源] 拉取接口数据: ${type}`);
+        }
+        const text = await response.text();
+        try {
+            return JSON.parse(text);
+        } catch (parseError) {
+            console.warn("JSON parse failed, returning raw text", parseError);
+            return text;
+        }
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+/** 对指定上游（base 为 null 时用默认上游）做一次搜索并归一化结果。 */
+async function searchOnce(keyword, source, count, page, base, debugLogger) {
+    const signature = API.generateSignature();
+    const url = withApiBase(`${API.baseUrl}?types=search&source=${source}&name=${encodeURIComponent(keyword)}&count=${count}&pages=${page}&s=${signature}`, base);
+    if (typeof debugLogger === "function") debugLogger(`API请求: ${url}`);
+    const data = await fetchJsonWithTimeout(url, FALLBACK_ATTEMPT_TIMEOUT_MS, debugLogger);
+    if (typeof debugLogger === "function") debugLogger(`API响应: ${JSON.stringify(data).substring(0, 200)}...`);
+    if (!Array.isArray(data)) throw new Error("搜索结果格式错误");
+    return data.map(song => ({
+        id: song.id,
+        name: song.name,
+        artist: song.artist,
+        album: song.album,
+        pic_id: song.pic_id,
+        url_id: song.url_id,
+        lyric_id: song.lyric_id,
+        source: song.source,
+    }));
+}
+
+/** 对指定上游拉一次榜单并归一化。 */
+async function fetchRadarOnce(playlistId, limit, offset, base) {
+    const signature = API.generateSignature();
+    const params = new URLSearchParams({
+        types: "playlist",
+        id: playlistId,
+        limit: String(limit),
+        offset: String(offset),
+        s: signature,
+    });
+    const url = withApiBase(`${API.baseUrl}?${params.toString()}`, base);
+    const data = await fetchJsonWithTimeout(url);
+    const tracks = data && data.playlist && Array.isArray(data.playlist.tracks)
+        ? data.playlist.tracks.slice(0, limit)
+        : [];
+    if (tracks.length === 0) throw new Error("No tracks found");
+    return tracks.map(track => {
+        const directPicUrl = track.al?.picUrl || (typeof track.al?.pic === "string" && track.al.pic.startsWith("http") ? track.al.pic : "");
+        return {
+            id: track.id,
+            name: track.name,
+            artist: Array.isArray(track.ar) ? track.ar.map(artist => artist.name).join(" / ") : (track.ar?.name || "未知艺术家"),
+            album: track.al?.name || "",
+            source: "netease",
+            lyric_id: track.id,
+            pic: directPicUrl,
+            pic_id: track.al?.pic_str || track.al?.pic || "",
+            url_id: track.id,
+        };
+    });
 }
 
 export const BACKGROUND_TRANSITION_DURATION = 850;
@@ -272,35 +463,47 @@ export const API = {
     },
 
     search: async (keyword, source = "netease", count = 20, page = 1, debugLogger = null) => {
-        const signature = API.generateSignature();
-        const url = withActiveApiBase(`${API.baseUrl}?types=search&source=${source}&name=${encodeURIComponent(keyword)}&count=${count}&pages=${page}&s=${signature}`);
-
         try {
-            if (typeof debugLogger === "function") debugLogger(`API请求: ${url}`);
-            const data = await API.fetchJson(url, debugLogger);
-            if (typeof debugLogger === "function") debugLogger(`API响应: ${JSON.stringify(data).substring(0, 200)}...`);
-
-            if (!Array.isArray(data)) throw new Error("搜索结果格式错误");
-
-            return data.map(song => ({
-                id: song.id,
-                name: song.name,
-                artist: song.artist,
-                album: song.album,
-                pic_id: song.pic_id,
-                url_id: song.url_id,
-                lyric_id: song.lyric_id,
-                source: song.source,
-            }));
+            return await searchOnce(keyword, source, count, page, getActiveApiBaseUrl(), debugLogger);
         } catch (error) {
             if (typeof debugLogger === "function") debugLogger(`API错误: ${error.message}`);
             throw error;
         }
     },
 
-    getRadarPlaylist: async (playlistId = "3778678", options = {}) => {
-        const signature = API.generateSignature();
+    /**
+     * 搜索轮询：按 getApiFallbackBases() 的顺序逐个上游尝试；某上游报错
+     * 或返回空结果就换下一个。全部返回空时返回 []，全部报错时抛最后一个错。
+     * “当前生效”设置不变——轮询只影响本次请求，不改动用户设定的首选顺序。
+     * 音源检测面板继续用 API.search，不走轮询，检测结果才如实反映单个上游。
+     */
+    searchWithFallback: async (keyword, source = "netease", count = 20, page = 1, debugLogger = null) => {
+        const bases = getApiFallbackBases();
+        let lastError = null;
+        let sawEmpty = false;
+        for (const base of bases) {
+            try {
+                const results = await searchOnce(keyword, source, count, page, base, debugLogger);
+                if (results.length > 0) {
+                    if (bases.indexOf(base) > 0 && typeof debugLogger === "function") {
+                        debugLogger(`[轮询] 上游 ${describeApiBase(base)} 返回 ${results.length} 条结果`);
+                    }
+                    return results;
+                }
+                sawEmpty = true;
+                if (typeof debugLogger === "function") debugLogger(`[轮询] 上游 ${describeApiBase(base)} 返回空结果，尝试下一个音源`);
+            } catch (error) {
+                lastError = error;
+                const note = `[轮询] 上游 ${describeApiBase(base)} 失败 (${error.message})，尝试下一个音源`;
+                if (typeof debugLogger === "function") debugLogger(note);
+                else console.warn(note, error);
+            }
+        }
+        if (sawEmpty) return [];
+        throw lastError || new Error("搜索失败");
+    },
 
+    getRadarPlaylist: async (playlistId = "3778678", options = {}) => {
         let limit = 20;
         let offset = 0;
 
@@ -320,46 +523,56 @@ export const API = {
         limit = Math.max(1, Math.min(200, Math.trunc(limit)) || 20);
         offset = Math.max(0, Math.trunc(offset) || 0);
 
-        const params = new URLSearchParams({
-            types: "playlist",
-            id: playlistId,
-            limit: String(limit),
-            offset: String(offset),
-            s: signature,
-        });
-        const url = withActiveApiBase(`${API.baseUrl}?${params.toString()}`);
-
         try {
-            const data = await API.fetchJson(url);
-            const tracks = data && data.playlist && Array.isArray(data.playlist.tracks)
-                ? data.playlist.tracks.slice(0, limit)
-                : [];
-
-            if (tracks.length === 0) throw new Error("No tracks found");
-
-            return tracks.map(track => {
-                const directPicUrl = track.al?.picUrl || (typeof track.al?.pic === "string" && track.al.pic.startsWith("http") ? track.al.pic : "");
-                return {
-                    id: track.id,
-                    name: track.name,
-                    artist: Array.isArray(track.ar) ? track.ar.map(artist => artist.name).join(" / ") : (track.ar?.name || "未知艺术家"),
-                    album: track.al?.name || "",
-                    source: "netease",
-                    lyric_id: track.id,
-                    pic: directPicUrl,
-                    pic_id: track.al?.pic_str || track.al?.pic || "",
-                    url_id: track.id,
-                };
-            });
+            return await fetchRadarOnce(playlistId, limit, offset, getActiveApiBaseUrl());
         } catch (error) {
             console.error("API request failed:", error);
             throw error;
         }
     },
 
-    getSongUrl: (song, quality = "320") => {
+    /** 榜单轮询：与 searchWithFallback 相同顺序，全部失败时抛最后一个错。 */
+    getRadarPlaylistWithFallback: async (playlistId = "3778678", options = {}) => {
+        let limit = 20;
+        let offset = 0;
+
+        if (typeof options === "number") {
+            limit = options;
+        } else if (options && typeof options === "object") {
+            if (Number.isFinite(options.limit)) {
+                limit = options.limit;
+            } else if (Number.isFinite(options.count)) {
+                limit = options.count;
+            }
+            if (Number.isFinite(options.offset)) {
+                offset = options.offset;
+            }
+        }
+
+        limit = Math.max(1, Math.min(200, Math.trunc(limit)) || 20);
+        offset = Math.max(0, Math.trunc(offset) || 0);
+
+        const bases = getApiFallbackBases();
+        let lastError = null;
+        for (const base of bases) {
+            try {
+                return await fetchRadarOnce(playlistId, limit, offset, base);
+            } catch (error) {
+                lastError = error;
+                console.warn(`[轮询] 上游 ${describeApiBase(base)} 榜单失败，尝试下一个音源:`, error);
+            }
+        }
+        console.error("API request failed:", lastError);
+        throw lastError || new Error("No tracks found");
+    },
+
+    getSongUrlWithBase: (song, quality = "320", base = null) => {
         const signature = API.generateSignature();
-        return withActiveApiBase(`${API.baseUrl}?types=url&id=${song.id}&source=${song.source || "netease"}&br=${quality}&s=${signature}`);
+        return withApiBase(`${API.baseUrl}?types=url&id=${song.id}&source=${song.source || "netease"}&br=${quality}&s=${signature}`, base);
+    },
+
+    getSongUrl: (song, quality = "320") => {
+        return API.getSongUrlWithBase(song, quality, getActiveApiBaseUrl());
     },
 
     getLyric: (song) => {

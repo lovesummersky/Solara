@@ -2,7 +2,7 @@
  * Solara 音质选择器、音源切换与 Apple 风格毛玻璃浮动菜单定位系统
  */
 
-import { QUALITY_OPTIONS, SOURCE_OPTIONS, normalizeQuality, normalizeSource } from "../constants.js";
+import { QUALITY_OPTIONS, SOURCE_OPTIONS, getVisibleSourceOptions, normalizeQuality, normalizeSource } from "../constants.js";
 import { safeSetLocalStorage } from "./storage.js";
 
 let qualityMenuAnchor = null;
@@ -76,7 +76,14 @@ export function buildQualityMenu(state, dom) {
 
 export function buildSourceMenu(state, dom) {
     if (!dom.sourceMenu) return;
-    const optionsHtml = SOURCE_OPTIONS.map(option => {
+    const visibleOptions = getVisibleSourceOptions();
+    // 当前选中的平台若已被检测结论隐藏，自动切到第一个可见平台，避免选了一个搜不到的源。
+    if (!visibleOptions.some(option => option.value === state.searchSource)) {
+        state.searchSource = visibleOptions[0].value;
+        safeSetLocalStorage("searchSource", state.searchSource);
+        updateSourceLabel(state, dom);
+    }
+    const optionsHtml = visibleOptions.map(option => {
         const isActive = option.value === state.searchSource;
         return `
             <button type="button" class="source-option source-menu-item${isActive ? " active" : ""}" data-source="${option.value}" role="option" aria-selected="${isActive}">

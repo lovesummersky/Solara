@@ -74,7 +74,11 @@ export async function onRequest({ request }: { request: Request }): Promise<Resp
     if (!payload || typeof payload !== "object") {
       return jsonResponse({ ok: false, error: "请求体必须是 JSON" }, 400);
     }
-    target = typeof payload.url === "string" ? payload.url : "";
+    target = typeof payload.url === "string" && payload.url ? payload.url : "";
+    if (!target) {
+      // 兼容只把 url 放在查询串里的调用方（Worker 旧版 POST 曾这样发）。
+      target = new URL(request.url).searchParams.get("url") || "";
+    }
     method = typeof payload.method === "string" ? payload.method.toUpperCase() : "GET";
     if (payload.headers && typeof payload.headers === "object") {
       for (const [key, value] of Object.entries(payload.headers)) {

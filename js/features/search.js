@@ -471,7 +471,7 @@ export async function performSearch(isLiveSearch = false, state, dom, callbacks 
 
         log(`[搜索发起] 关键词: "${query}", 音源: ${source}, 页码: ${state.searchPage}`);
 
-        const results = await API.search(query, source, 20, state.searchPage, debugLogger);
+        const results = await API.searchWithFallback(query, source, 20, state.searchPage, debugLogger);
         log(`[搜索结果] API 返回 ${results.length} 首曲目`);
 
         if (listContainer) {
@@ -533,7 +533,7 @@ export async function loadMoreResults(state, dom, callbacks = {}, debugLogger = 
         const source = normalizeSource(state.searchSource);
         state.searchSource = source;
         safeSetLocalStorage("searchSource", source);
-        const results = await API.search(state.searchKeyword, source, 20, state.searchPage, debugLogger);
+        const results = await API.searchWithFallback(state.searchKeyword, source, 20, state.searchPage, debugLogger);
 
         if (results.length > 0) {
             state.searchResults = [...state.searchResults, ...results];
